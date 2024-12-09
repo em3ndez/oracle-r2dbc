@@ -21,7 +21,6 @@
 
 package oracle.r2dbc.test;
 
-import io.r2dbc.spi.ColumnMetadata;
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactories;
 import io.r2dbc.spi.ConnectionFactory;
@@ -30,15 +29,14 @@ import io.r2dbc.spi.Option;
 import oracle.jdbc.OracleConnection;
 import oracle.r2dbc.util.SharedConnectionFactory;
 import org.reactivestreams.Publisher;
-import reactor.core.publisher.Flux;
 
 import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.util.Optional;
 import java.util.Properties;
-import java.util.stream.Collectors;
 
 /**
  * Stores configuration used by integration tests that connect to a database.
@@ -48,6 +46,16 @@ import java.util.stream.Collectors;
 public final class DatabaseConfig {
 
   private DatabaseConfig() {}
+
+  /**
+   * Returns the protocol used to connect with a database, specified as
+   * {@code PROTOCOL} in the "config.properties" file.
+   * @return Connection protocol for the test database. May be {@code null} if
+   * no protocol is configured.
+   */
+  public static String protocol() {
+    return PROTOCOL;
+  }
 
   /**
    * Returns the hostname of the server where a test database listens for
@@ -171,9 +179,9 @@ public final class DatabaseConfig {
    * @return The major version number of the test database.
    */
   public static int databaseVersion() {
-    try (var jdbcConnection = DriverManager.getConnection(String.format(
-      "jdbc:oracle:thin:@%s:%s/%s", host(), port(), serviceName()),
-      user(), password())) {
+    try (
+      var jdbcConnection =
+        DriverManager.getConnection(jdbcUrl(), user(), password())) {
       return jdbcConnection.getMetaData().getDatabaseMajorVersion();
     }
     catch (SQLException sqlException) {
@@ -182,27 +190,78 @@ public final class DatabaseConfig {
   }
 
   /**
-   * Queries the {@code user_errors} data dictionary view and prints all rows.
-   * When writing new tests that declare a PL/SQL procedure or function,
-   * "ORA-17110: executed completed with a warning" results if the PL/SQL has
-   * a syntax error. The error details will be printed by calling this method.
+   * Returns an Oracle JDBC URL for opening connections to the test database.
+   * @return URL for the Oracle JDBC Driver. Not null.
    */
-  public static void showErrors(Connection connection) {
-      Flux.from(connection.createStatement(
-        "SELECT * FROM user_errors ORDER BY sequence")
-        .execute())
-        .flatMap(result ->
-          result.map((row, metadata) ->
-            metadata.getColumnMetadatas()
-              .stream()
-              .map(ColumnMetadata::getName)
-              .map(name -> name + ": " + row.get(name))
-              .collect(Collectors.joining("\n"))))
-      .toStream()
-      .map(errorText -> "\n" + errorText)
-      .forEach(System.err::println);
+  public static String jdbcUrl() {
+    return String.format(
+      "jdbc:oracle:thin:@%s%s:%d/%s",
+      protocol() == null ? "" : protocol() + ":",
+      host(), port(), serviceName());
   }
 
+  /**
+   * Returns the major version number of the Oracle JDBC Driver installed as
+   * a service provider for java.sql.Driver.
+   * @return The major version number, such as 21 or 23.
+   */
+  public static int jdbcVersion() {
+    try {
+      return DriverManager.getDriver("jdbc:oracle:thin:").getMajorVersion();
+    }
+    catch (SQLException sqlException) {
+      throw new AssertionError(sqlException);
+    }
+  }
+
+  /**
+   * Returns the minor version number of the Oracle JDBC Driver installed as
+   * a service provider for java.sql.Driver.
+   * @return The major version number, such as 11 for 21.11, or 4 for 23.4.
+   */
+  public static int jdbcMinorVersion() {
+    try {
+      return DriverManager.getDriver("jdbc:oracle:thin:").getMinorVersion();
+    }
+    catch (SQLException sqlException) {
+      throw new AssertionError(sqlException);
+    }
+  }
+
+  /**
+   * Returns the options parsed from the "config.properties" resource.
+   */
+  public static ConnectionFactoryOptions connectionFactoryOptions() {
+
+    ConnectionFactoryOptions.Builder optionsBuilder =
+      ConnectionFactoryOptions.builder()
+        .option(ConnectionFactoryOptions.DRIVER, "oracle")
+        .option(ConnectionFactoryOptions.HOST, HOST)
+        .option(ConnectionFactoryOptions.PORT, PORT)
+        .option(ConnectionFactoryOptions.DATABASE, SERVICE_NAME)
+        .option(ConnectionFactoryOptions.USER, USER)
+        .option(ConnectionFactoryOptions.PASSWORD, PASSWORD)
+        // Disable statement caching in order to verify cursor closing;
+        // Cached statements don't close their cursors
+        .option(Option.valueOf(
+            OracleConnection.CONNECTION_PROPERTY_IMPLICIT_STATEMENT_CACHE_SIZE),
+          0)
+        // Disable out-of-band breaks to support testing with the 18.x
+        // database. The 19.x database will automatically detect when it's
+        // running on a system where OOB is not supported, but the 18.x
+        // database does not do this and so statement timeout tests will
+        // hang if the database system does not support OOB
+        .option(Option.valueOf(
+            OracleConnection.CONNECTION_PROPERTY_THIN_NET_DISABLE_OUT_OF_BAND_BREAK),
+          "true");
+
+    if (PROTOCOL != null)
+      optionsBuilder.option(ConnectionFactoryOptions.PROTOCOL, PROTOCOL);
+
+    return optionsBuilder.build();
+  }
+
+  private static final String PROTOCOL;
   private static final String HOST;
   private static final int PORT;
   private static final String SERVICE_NAME;
@@ -237,30 +296,9 @@ public final class DatabaseConfig {
         Long.parseLong(prop.getProperty("CONNECT_TIMEOUT")));
       SQL_TIMEOUT = Duration.ofSeconds(
         Long.parseLong(prop.getProperty("SQL_TIMEOUT")));
+      PROTOCOL = prop.getProperty("PROTOCOL");
 
-      CONNECTION_FACTORY = ConnectionFactories.get(
-        ConnectionFactoryOptions.builder()
-          .option(ConnectionFactoryOptions.DRIVER, "oracle")
-          .option(ConnectionFactoryOptions.HOST, HOST)
-          .option(ConnectionFactoryOptions.PORT, PORT)
-          .option(ConnectionFactoryOptions.DATABASE, SERVICE_NAME)
-          .option(ConnectionFactoryOptions.USER, USER)
-          .option(ConnectionFactoryOptions.PASSWORD, PASSWORD)
-          // Disable statement caching in order to verify cursor closing;
-          // Cached statements don't close their cursors
-          .option(Option.valueOf(
-            OracleConnection.CONNECTION_PROPERTY_IMPLICIT_STATEMENT_CACHE_SIZE),
-            0)
-          // Disable out-of-band breaks to support testing with the 18.x
-          // database. The 19.x database will automatically detect when it's
-          // running on a system where OOB is not supported, but the 18.x
-          // database does not do this and so statement timeout tests will
-          // hang if the database system does not support OOB
-          .option(Option.valueOf(
-            OracleConnection.CONNECTION_PROPERTY_THIN_NET_DISABLE_OUT_OF_BAND_BREAK),
-            "true")
-          .build());
-
+      CONNECTION_FACTORY = ConnectionFactories.get(connectionFactoryOptions());
       SHARED_CONNECTION_FACTORY = new SharedConnectionFactory(
         CONNECTION_FACTORY.create(),
         CONNECTION_FACTORY.getMetadata());

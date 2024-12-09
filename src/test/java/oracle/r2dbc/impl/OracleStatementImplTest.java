@@ -22,7 +22,8 @@
 package oracle.r2dbc.impl;
 
 import io.r2dbc.spi.Connection;
-import io.r2dbc.spi.Parameter;
+import io.r2dbc.spi.ConnectionFactories;
+import io.r2dbc.spi.OutParameters;
 import io.r2dbc.spi.Parameters;
 import io.r2dbc.spi.R2dbcException;
 import io.r2dbc.spi.R2dbcNonTransientException;
@@ -30,8 +31,17 @@ import io.r2dbc.spi.R2dbcType;
 import io.r2dbc.spi.Result;
 import io.r2dbc.spi.Result.Message;
 import io.r2dbc.spi.Result.UpdateCount;
+import io.r2dbc.spi.Row;
 import io.r2dbc.spi.Statement;
-import io.r2dbc.spi.Type;
+import oracle.r2dbc.OracleR2dbcObject;
+import oracle.r2dbc.OracleR2dbcOptions;
+import oracle.r2dbc.OracleR2dbcTypes;
+import oracle.r2dbc.OracleR2dbcWarning;
+import oracle.r2dbc.test.DatabaseConfig;
+import oracle.sql.VECTOR;
+import oracle.sql.json.OracleJsonFactory;
+import oracle.sql.json.OracleJsonObject;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
@@ -39,20 +49,39 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.Signal;
 
 import java.sql.RowId;
+import java.sql.SQLException;
 import java.sql.SQLWarning;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.DoubleStream;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import static java.util.Arrays.asList;
 import static oracle.r2dbc.test.DatabaseConfig.connectTimeout;
+import static oracle.r2dbc.test.DatabaseConfig.connectionFactoryOptions;
+import static oracle.r2dbc.test.DatabaseConfig.databaseVersion;
+import static oracle.r2dbc.test.DatabaseConfig.jdbcMinorVersion;
 import static oracle.r2dbc.test.DatabaseConfig.newConnection;
 import static oracle.r2dbc.test.DatabaseConfig.sharedConnection;
+import static oracle.r2dbc.test.DatabaseConfig.sqlTimeout;
+import static oracle.r2dbc.test.TestUtils.constructObject;
+import static oracle.r2dbc.test.TestUtils.showErrors;
 import static oracle.r2dbc.util.Awaits.awaitError;
 import static oracle.r2dbc.util.Awaits.awaitExecution;
 import static oracle.r2dbc.util.Awaits.awaitMany;
@@ -63,11 +92,13 @@ import static oracle.r2dbc.util.Awaits.awaitUpdate;
 import static oracle.r2dbc.util.Awaits.consumeOne;
 import static oracle.r2dbc.util.Awaits.tryAwaitExecution;
 import static oracle.r2dbc.util.Awaits.tryAwaitNone;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Verifies that
@@ -811,7 +842,7 @@ public class OracleStatementImplTest {
 
       // Expect the statement to execute with previously added binds, and
       // then emit an error if binds are missing in the final set of binds.
-      List<Signal<Integer>> signals =
+      List<Signal<Long>> signals =
         awaitOne(Flux.from(connection.createStatement(
           "INSERT INTO testAdd VALUES (:x, :y)")
           .bind("x", 0).bind("y", 1).add()
@@ -911,7 +942,7 @@ public class OracleStatementImplTest {
         selectStatement::execute);
 
       // Expect update to execute when a subscriber subscribes
-      awaitOne(1,
+      awaitOne(1L,
         Flux.from(updatePublisher)
           .flatMap(result -> result.getRowsUpdated()));
       awaitQuery(
@@ -1262,7 +1293,7 @@ public class OracleStatementImplTest {
       // inserted by the call.
       consumeOne(connection.createStatement(
         "BEGIN testOneInOutCallAdd(?); END;")
-        .bind(0, new InOutParameter(1, R2dbcType.NUMERIC))
+        .bind(0, Parameters.inOut(R2dbcType.NUMERIC, 1))
         .execute(),
         result -> {
           awaitNone(result.getRowsUpdated());
@@ -1276,7 +1307,7 @@ public class OracleStatementImplTest {
       // parameter's default value to have been inserted by the call.
       consumeOne(connection.createStatement(
         "BEGIN testOneInOutCallAdd(:value); END;")
-        .bind("value", new InOutParameter(2, R2dbcType.NUMERIC))
+        .bind("value", Parameters.inOut(R2dbcType.NUMERIC, 2))
         .execute(),
         result ->
           awaitOne(1, result.map(row ->
@@ -1290,7 +1321,7 @@ public class OracleStatementImplTest {
       // parameter's value to have been inserted by the call.
       consumeOne(connection.createStatement(
         "BEGIN testOneInOutCallAdd(:value); END;")
-        .bind("value", new InOutParameter(3))
+        .bind("value", Parameters.inOut(3))
         .execute(),
         result ->
           awaitNone(result.getRowsUpdated()));
@@ -1303,7 +1334,7 @@ public class OracleStatementImplTest {
       // parameter's value to have been inserted by the call.
       consumeOne(connection.createStatement(
         "BEGIN testOneInOutCallAdd(?); END;")
-        .bind(0, new InOutParameter(4))
+        .bind(0, Parameters.inOut(4))
         .execute(),
         result ->
           awaitOne(3, result.map(row ->
@@ -1357,8 +1388,8 @@ public class OracleStatementImplTest {
       // inserted by the call.
       consumeOne(connection.createStatement(
         "BEGIN testMultiInOutCallAdd(:value1, :value2); END;")
-        .bind("value1", new InOutParameter(1, R2dbcType.NUMERIC))
-        .bind("value2", new InOutParameter(101, R2dbcType.NUMERIC))
+        .bind("value1", Parameters.inOut(R2dbcType.NUMERIC, 1))
+        .bind("value2", Parameters.inOut(R2dbcType.NUMERIC, 101))
         .execute(),
         result ->
           awaitNone(result.getRowsUpdated()));
@@ -1371,9 +1402,9 @@ public class OracleStatementImplTest {
       // Result with one rows having the previous value. Expect the IN
       // parameter's default value to have been inserted by the call.
       consumeOne(connection.createStatement(
-        "BEGIN testMultiInOutCallAdd(?, :value2); END;")
-        .bind(0, new InOutParameter(2, R2dbcType.NUMERIC))
-        .bind("value2", new InOutParameter(102, R2dbcType.NUMERIC))
+        "BEGIN testMultiInOutCallAdd(:value1, :value2); END;")
+        .bind("value1", Parameters.inOut(R2dbcType.NUMERIC, 2))
+        .bind("value2", Parameters.inOut(R2dbcType.NUMERIC, 102))
         .execute(),
         result ->
           awaitOne(asList(1, 101), result.map(row ->
@@ -1389,8 +1420,8 @@ public class OracleStatementImplTest {
       // parameter's value to have been inserted by the call.
       consumeOne(connection.createStatement(
         "BEGIN testMultiInOutCallAdd(?, ?); END;")
-        .bind(0, new InOutParameter(3))
-        .bind(1, new InOutParameter(103))
+        .bind(0, Parameters.inOut(3))
+        .bind(1, Parameters.inOut(103))
         .execute(),
         result -> awaitNone(result.getRowsUpdated()));
       awaitQuery(asList(asList(3, 103)),
@@ -1405,8 +1436,8 @@ public class OracleStatementImplTest {
       consumeOne(connection.createStatement(
         "BEGIN testMultiInOutCallAdd(" +
           "inout_value2 => :value2, inout_value1 => :value1); END;")
-        .bind("value1", new InOutParameter(4))
-        .bind("value2", new InOutParameter(104))
+        .bind("value1", Parameters.inOut(4))
+        .bind("value2", Parameters.inOut(104))
         .execute(),
         result ->
           awaitOne(asList(3, 103), result.map(row ->
@@ -1767,9 +1798,9 @@ public class OracleStatementImplTest {
       IntStream.range(0, 100)
         .forEach(i -> insert.bind(0, i).add());
       insert.bind(0, 100);
-      awaitOne(101, Flux.from(insert.execute())
+      awaitOne(101L, Flux.from(insert.execute())
         .flatMap(Result::getRowsUpdated)
-        .reduce(0, (total, updateCount) -> total + updateCount));
+        .reduce(0L, (total, updateCount) -> total + updateCount));
 
       // Create a procedure that returns a cursor
       awaitExecution(connection.createStatement(
@@ -1844,8 +1875,8 @@ public class OracleStatementImplTest {
               .collectList()));
 
       // Expect Implicit Results to have no update counts
-      AtomicInteger count = new AtomicInteger(-9);
-      awaitMany(asList(-9, -10),
+      AtomicLong count = new AtomicLong(-9);
+      awaitMany(asList(-9L, -10L),
         Flux.from(connection.createStatement("BEGIN countDown; END;")
           .execute())
           .concatMap(result ->
@@ -1878,9 +1909,9 @@ public class OracleStatementImplTest {
       IntStream.range(0, 100)
         .forEach(i -> insert.bind(0, i).add());
       insert.bind(0, 100);
-      awaitOne(101, Flux.from(insert.execute())
+      awaitOne(101L, Flux.from(insert.execute())
         .flatMap(Result::getRowsUpdated)
-        .reduce(0, (total, updateCount) -> total + updateCount));
+        .reduce(0L, (total, updateCount) -> total + updateCount));
 
       // Create a procedure that returns a cursor
       awaitExecution(connection.createStatement(
@@ -1961,8 +1992,8 @@ public class OracleStatementImplTest {
               .collectList()));
 
       // Expect Implicit Results to have no update counts
-      AtomicInteger count = new AtomicInteger(-8);
-      awaitMany(asList(-8, -9, -10),
+      AtomicLong count = new AtomicLong(-8);
+      awaitMany(asList(-8L, -9L, -10L),
         Flux.from(connection.createStatement("BEGIN countDown(?); END;")
           .bind(0, Parameters.out(R2dbcType.VARCHAR))
           .execute())
@@ -1981,7 +2012,7 @@ public class OracleStatementImplTest {
 
   /**
    * Verifies that {@link OracleStatementImpl#execute()} emits a {@link Result}
-   * with a {@link Message} segment when the execution results in a
+   * with a {@link OracleR2dbcWarning} segment when the execution results in a
    * warning.
    */
   @Test
@@ -1991,9 +2022,10 @@ public class OracleStatementImplTest {
     try {
 
       // Create a procedure using invalid syntax and expect the Result to
-      // have a Message with an R2dbcException having a SQLWarning as it's
-      // initial cause. Expect the Result to have an update count of zero as
-      // well, indicating that the statement completed after the warning.
+      // have an OracleR2dbcWarning with an R2dbcException having a SQLWarning
+      // as it's initial cause. Expect the Result to have an update count of
+      // zero as well, indicating that the statement completed after the
+      // warning.
       AtomicInteger segmentCount = new AtomicInteger(0);
       R2dbcException r2dbcException =
         awaitOne(Flux.from(connection.createStatement(
@@ -2004,15 +2036,17 @@ public class OracleStatementImplTest {
             result.flatMap(segment -> {
               int index = segmentCount.getAndIncrement();
               if (index == 0) {
-                assertTrue(segment instanceof Message,
-                  "Unexpected Segment: " + segment);
-                return Mono.just(((Message)segment).exception());
-              }
-              else if (index == 1) {
+                // Expect the first segment to be an update count
                 assertTrue(segment instanceof UpdateCount,
                   "Unexpected Segment: " + segment);
                 assertEquals(0, ((UpdateCount)segment).value());
                 return Mono.empty();
+              }
+              else if (index == 1) {
+                // Expect second segment to be a warning
+                assertTrue(segment instanceof OracleR2dbcWarning,
+                  "Unexpected Segment: " + segment);
+                return Mono.just(((OracleR2dbcWarning)segment).exception());
               }
               else {
                 fail("Unexpected Segment: " + segment);
@@ -2033,119 +2067,98 @@ public class OracleStatementImplTest {
   }
 
   /**
-   * Verifies that concurrent statement execution does not cause threads
-   * to block.
+   * Verifies that concurrent statement execution on a single
+   * connection does not cause threads to block when there are many threads
+   * available.
    */
   @Test
-  public void testConcurrentExecute() {
-    Connection connection = awaitOne(sharedConnection());
+  public void testConcurrentExecuteManyThreads() throws InterruptedException {
+    ExecutorService executorService = Executors.newFixedThreadPool(4);
     try {
-
-      // Create many statements and execute them in parallel. "Many" should
-      // be enough to exhaust the common ForkJoinPool if any thread gets blocked
-      Publisher<Integer>[] publishers =
-        new Publisher[ForkJoinPool.getCommonPoolParallelism() * 4];
-
-      for (int i = 0; i < publishers.length; i++) {
-        Flux<Integer> flux = Flux.from(connection.createStatement(
-          "SELECT " + i + " FROM sys.dual")
-          .execute())
-          .flatMap(result ->
-            result.map(row -> row.get(0, Integer.class)))
-          .cache();
-
-        flux.subscribe();
-        publishers[i] = flux;
+      Connection connection = awaitOne(connect(executorService));
+      try {
+        verifyConcurrentExecute(connection);
       }
-
-      awaitMany(
-        IntStream.range(0, publishers.length)
-          .boxed()
-          .collect(Collectors.toList()),
-        Flux.concat(publishers));
+      finally {
+        tryAwaitNone(connection.close());
+      }
     }
     finally {
-      tryAwaitNone(connection.close());
+      executorService.shutdown();
+      executorService.awaitTermination(
+        sqlTimeout().toSeconds(), TimeUnit.SECONDS);
     }
   }
 
   /**
-   * Verifies that concurrent statement execution and row fetching does not
-   * cause threads to block.
+   * Verifies that concurrent statement execution on a single
+   * connection does not cause threads to block when there is just one thread
+   * available.
    */
   @Test
-  public void testConcurrentFetch() {
-    Connection connection = awaitOne(sharedConnection());
+  public void testConcurrentExecuteSingleThread() throws InterruptedException {
+    ExecutorService executorService = Executors.newSingleThreadExecutor();
     try {
-
-      awaitExecution(connection.createStatement(
-        "CREATE TABLE testConcurrentFetch (value NUMBER)"));
-
-      // Create many statements and execute them in parallel. "Many" should
-      // be enough to exhaust the common ForkJoinPool if any thread gets blocked
-      Publisher<Integer>[] publishers =
-        new Publisher[ForkJoinPool.getCommonPoolParallelism() * 4];
-
-      for (int i = 0; i < publishers.length; i++) {
-
-        // Each publisher batch inserts a range of 100 values
-        Statement statement = connection.createStatement(
-          "INSERT INTO testConcurrentFetch VALUES (?)");
-        int start = i * 100;
-        statement.bind(0, start);
-        IntStream.range(start + 1, start + 100)
-          .forEach(value -> {
-            statement.add().bind(0, value);
-          });
-
-        Mono<Integer> mono = Flux.from(statement.execute())
-          .flatMap(Result::getRowsUpdated)
-          .collect(Collectors.summingInt(Integer::intValue))
-          .cache();
-
-        // Execute in parallel, and retain the result for verification later
-        mono.subscribe();
-        publishers[i] = mono;
+      Connection connection = awaitOne(connect(executorService));
+      try {
+        verifyConcurrentExecute(connection);
       }
-
-      // Expect each publisher to emit an update count of 100
-      awaitMany(
-        IntStream.range(0, publishers.length)
-          .map(i -> 100)
-          .boxed()
-          .collect(Collectors.toList()),
-        Flux.merge(publishers));
-
-      // Create publishers that fetch rows in parallel
-      Publisher<List<Integer>>[] fetchPublishers =
-        new Publisher[publishers.length];
-
-      for (int i = 0; i < publishers.length; i++) {
-        Mono<List<Integer>> mono = Flux.from(connection.createStatement(
-          "SELECT value FROM testConcurrentFetch ORDER BY value")
-          .execute())
-          .flatMap(result ->
-            result.map(row -> row.get(0, Integer.class)))
-          .collect(Collectors.toList())
-          .cache();
-
-        // Execute in parallel, and retain the result for verification later
-        mono.subscribe();
-        fetchPublishers[i] = mono;
+      finally {
+        tryAwaitNone(connection.close());
       }
-
-      // Expect each fetch publisher to get the same result
-      List<Integer> expected = IntStream.range(0, publishers.length * 100)
-        .boxed()
-        .collect(Collectors.toList());
-
-      for (Publisher<List<Integer>> publisher : fetchPublishers)
-        awaitOne(expected, publisher);
     }
     finally {
-      tryAwaitExecution(connection.createStatement(
-        "DROP TABLE testConcurrentFetch"));
-      tryAwaitNone(connection.close());
+      executorService.shutdown();
+      executorService.awaitTermination(
+        sqlTimeout().toSeconds(), TimeUnit.SECONDS);
+    }
+  }
+
+  /**
+   * Verifies that concurrent statement execution and row fetching on a single
+   * connection does not cause threads to block when there is just one thread
+   * available.
+   */
+  @Test
+  public void testConcurrentFetchSingleThread() throws InterruptedException {
+    ExecutorService executorService = Executors.newSingleThreadExecutor();
+    try {
+      Connection connection = awaitOne(connect(executorService));
+      try {
+        verifyConcurrentFetch(connection);
+      }
+      finally {
+        tryAwaitNone(connection.close());
+      }
+    }
+    finally {
+      executorService.shutdown();
+      executorService.awaitTermination(
+        sqlTimeout().toSeconds(), TimeUnit.SECONDS);
+    }
+  }
+
+  /**
+   * Verifies that concurrent statement execution and row fetching on a single
+   * connection does not cause threads to block when there are many threads
+   * available.
+   */
+  @Test
+  public void testConcurrentFetchManyThreads() throws InterruptedException {
+    ExecutorService executorService = Executors.newFixedThreadPool(4);
+    try {
+      Connection connection = awaitOne(connect(executorService));
+      try {
+        verifyConcurrentFetch(connection);
+      }
+      finally {
+        tryAwaitNone(connection.close());
+      }
+    }
+    finally {
+      executorService.shutdown();
+      executorService.awaitTermination(
+        sqlTimeout().toSeconds(), TimeUnit.SECONDS);
     }
   }
 
@@ -2162,6 +2175,7 @@ public class OracleStatementImplTest {
         "CREATE TABLE testUsingWhenCancel (value NUMBER)"));
 
       // Use more threads than what the FJP has available
+      @SuppressWarnings({"unchecked","rawtypes"})
       Publisher<Boolean>[] publishers =
         new Publisher[ForkJoinPool.getCommonPoolParallelism() * 4];
 
@@ -2240,39 +2254,1320 @@ public class OracleStatementImplTest {
     }
   }
 
-  // TODO: Repalce with Parameters.inOut when that's available
-  private static final class InOutParameter
-    implements Parameter, Parameter.In, Parameter.Out {
-    final Type type;
-    final Object value;
+  /**
+   * Verifies that a SYS_REFCURSOR out parameter can be consumed as a
+   * {@link Result} object.
+   */
+  @Test
+  public void testRefCursorOut() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      List<TestRow> rows = createRows(100);
 
-    InOutParameter(Object value) {
-      this(value, new Type.InferredType() {
+      // Create a table with some rows to query
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testRefCursorTable(id NUMBER, value VARCHAR(10))"));
+      Statement insertStatement = connection.createStatement(
+        "INSERT INTO testRefCursorTable VALUES (:id, :value)");
+      awaitUpdate(
+        rows.stream()
+          .map(row -> 1)
+          .collect(Collectors.toList()),
+        bindRows(rows, insertStatement));
+
+      // Create a procedure that returns a cursor over the rows
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testRefCursorProcedure(" +
+          " countCursor OUT SYS_REFCURSOR)" +
+          " IS" +
+          " BEGIN" +
+          " OPEN countCursor FOR " +
+          "   SELECT id, value FROM testRefCursorTable" +
+          "   ORDER BY id;" +
+          " END;"));
+
+      // Call the procedure with the cursor registered as an out parameter, and
+      // expect it to map to a Result. Then consume the rows of the Result and
+      // verify they have the expected values inserted above.
+      awaitMany(
+        rows,
+        Flux.from(connection.createStatement(
+              "BEGIN testRefCursorProcedure(:countCursor); END;")
+            .bind("countCursor", Parameters.out(OracleR2dbcTypes.REF_CURSOR))
+            .execute())
+          .flatMap(result ->
+            result.map(outParameters ->
+              outParameters.get("countCursor")))
+          .cast(Result.class)
+          .flatMap(countCursor ->
+            countCursor.map(row ->
+              new TestRow(
+                row.get("id", Integer.class),
+                row.get("value", String.class)))));
+
+      // Verify the procedure call again. This time using an explicit
+      // Result.class argument to Row.get(...). Also, this time using
+      // Result.flatMap to create the publisher within the segment mapping
+      // function
+      awaitMany(
+        rows,
+        Flux.from(connection.createStatement(
+            "BEGIN testRefCursorProcedure(:countCursor); END;")
+          .bind("countCursor", Parameters.out(OracleR2dbcTypes.REF_CURSOR))
+          .execute())
+          .flatMap(result ->
+            result.flatMap(segment ->
+              ((Result.OutSegment)segment).outParameters()
+                  .get(0, Result.class)
+                  .map(row ->
+                    new TestRow(
+                      row.get("id", Integer.class),
+                      row.get("value", String.class))))));
+    }
+    catch (Exception exception) {
+      showErrors(connection);
+      throw exception;
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testRefCursorProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testRefCursorTable"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies that SYS_REFCURSOR out parameters can be consumed as
+   * {@link Result} objects.
+   */
+  @Test
+  public void testMultipleRefCursorOut() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      List<TestRow> rows = createRows(100);
+
+      // Create a table with some rows to query
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testMultiRefCursorTable(id NUMBER, value VARCHAR(10))"));
+      Statement insertStatement = connection.createStatement(
+        "INSERT INTO testMultiRefCursorTable VALUES (:id, :value)");
+      awaitUpdate(
+        rows.stream()
+          .map(row -> 1)
+          .collect(Collectors.toList()),
+        bindRows(rows, insertStatement));
+
+      // Create a procedure that returns a multiple cursors over the rows
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testMultiRefCursorProcedure(" +
+          " countCursor0 OUT SYS_REFCURSOR," +
+          " countCursor1 OUT SYS_REFCURSOR)" +
+          " IS" +
+          " BEGIN" +
+          " OPEN countCursor0 FOR " +
+          "   SELECT id, value FROM testMultiRefCursorTable" +
+          "   ORDER BY id;" +
+          " OPEN countCursor1 FOR " +
+          "   SELECT id, value FROM testMultiRefCursorTable" +
+          "   ORDER BY id DESC;" +
+          " END;"));
+
+      // Call the procedure with the cursors registered as out parameters, and
+      // expect them to map to Results. Then consume the rows of each Result and
+      // verify they have the expected values inserted above.
+      List<TestRow> expectedRows = new ArrayList<>(rows);
+      Collections.reverse(rows);
+      expectedRows.addAll(rows);
+      awaitMany(
+        expectedRows,
+        Flux.from(connection.createStatement(
+              "BEGIN testMultiRefCursorProcedure(:countCursor0, :countCursor1); END;")
+            .bind("countCursor0", Parameters.out(OracleR2dbcTypes.REF_CURSOR))
+            .bind("countCursor1", Parameters.out(OracleR2dbcTypes.REF_CURSOR))
+            .execute())
+          .flatMap(result ->
+            result.map(outParameters ->
+              List.of(
+                (Result)outParameters.get("countCursor0"),
+                (Result)outParameters.get("countCursor1"))))
+          .flatMap(results ->
+            Flux.concat(
+              results.get(0).map(row ->
+                new TestRow(
+                  row.get("id", Integer.class),
+                  row.get("value", String.class))),
+              results.get(1).map(row ->
+                new TestRow(
+                  row.get("id", Integer.class),
+                  row.get("value", String.class))))));
+
+      // Run the same verification, this time with Result.class argument to
+      // Row.get(...), and mapping the REF CURSOR Results into a Publisher
+      // within the row mapping function
+      awaitMany(
+        expectedRows,
+        Flux.from(connection.createStatement(
+              "BEGIN testMultiRefCursorProcedure(:countCursor0, :countCursor1); END;")
+            .bind("countCursor0", Parameters.out(OracleR2dbcTypes.REF_CURSOR))
+            .bind("countCursor1", Parameters.out(OracleR2dbcTypes.REF_CURSOR))
+            .execute())
+          .flatMap(result ->
+            result.map(outParameters ->
+              Flux.concat(
+                outParameters.get("countCursor0", Result.class).map(row ->
+                  new TestRow(
+                    row.get(0, Integer.class),
+                    row.get(1, String.class))),
+                outParameters.get("countCursor1", Result.class).map(row ->
+                  new TestRow(
+                    row.get(0, Integer.class),
+                    row.get(1, String.class))))))
+          .flatMap(Function.identity()));
+    }
+    catch (Exception exception) {
+      showErrors(connection);
+      throw exception;
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testMultiRefCursorProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testMultiRefCursorTable"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior for a PL/SQL call having {@code ARRAY} type IN bind
+   */
+  @Test
+  public void testInArrayCall() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE TEST_IN_ARRAY AS ARRAY(8) OF NUMBER"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testInArrayCall(id NUMBER, value TEST_IN_ARRAY)"));
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testInArrayProcedure (" +
+          " id IN NUMBER," +
+          " inArray IN TEST_IN_ARRAY)" +
+          " IS" +
+          " BEGIN" +
+          " INSERT INTO testInArrayCall VALUES(id, inArray);" +
+          " END;"));
+
+      class TestRow {
+        Long id;
+        int[] value;
+        TestRow(Long id, int[] value) {
+          this.id = id;
+          this.value = value;
+        }
         @Override
-        public Class<?> getJavaType() {
-          return value.getClass();
+        public boolean equals(Object other) {
+          return other instanceof TestRow
+            && Objects.equals(((TestRow) other).id, id)
+            && Objects.deepEquals(((TestRow)other).value, value);
         }
 
         @Override
-        public String getName() {
-          return "Inferred";
+        public String toString() {
+          return id + ", " + Arrays.toString(value);
         }
+
+        @Override
+        public int hashCode() {
+          return Objects.hash(id, Arrays.hashCode(value));
+        }
+      }
+
+      TestRow row0 = new TestRow(0L, new int[]{1, 2, 3});
+      OracleR2dbcTypes.ArrayType arrayType =
+        OracleR2dbcTypes.arrayType("TEST_IN_ARRAY");
+      Statement callStatement = connection.createStatement(
+        "BEGIN testInArrayProcedure(:id, :value); END;");
+      awaitExecution(
+        callStatement
+          .bind("id", row0.id)
+          .bind("value", Parameters.in(arrayType, row0.value)));
+
+      awaitQuery(
+        List.of(row0),
+        row ->
+          new TestRow(
+            row.get("id", Long.class),
+            row.get("value", int[].class)),
+        connection.createStatement(
+          "SELECT id, value FROM testInArrayCall ORDER BY id"));
+
+      TestRow row1 = new TestRow(1L, new int[]{4, 5, 6});
+      awaitExecution(
+        callStatement
+          .bind("id", row1.id)
+          .bind("value", Parameters.in(arrayType, row1.value)));
+
+      awaitQuery(
+        List.of(row0, row1),
+        row ->
+          new TestRow(
+            row.get("id", Long.class),
+            row.get("value", int[].class)),
+        connection.createStatement(
+          "SELECT id, value FROM testInArrayCall ORDER BY id"));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testInArrayCall"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testInArrayProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TYPE TEST_IN_ARRAY"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior for a PL/SQL call having {@code ARRAY} type OUT bind
+   */
+  @Test
+  public void testOutArrayCall() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE TEST_OUT_ARRAY AS ARRAY(8) OF NUMBER"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testOutArrayCall(id NUMBER, value TEST_OUT_ARRAY)"));
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testOutArrayProcedure (" +
+          "   inId IN NUMBER," +
+          "   outArray OUT TEST_OUT_ARRAY)" +
+          " IS" +
+          " BEGIN" +
+          "   SELECT value INTO outArray" +
+          "     FROM testOutArrayCall" +
+          "     WHERE id = inId;" +
+          " EXCEPTION" +
+          "   WHEN NO_DATA_FOUND THEN" +
+          "     outArray := NULL;" +
+          " END;"));
+
+      class TestRow {
+        Long id;
+        Integer[] value;
+        TestRow(Long id, Integer[] value) {
+          this.id = id;
+          this.value = value;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+          return other instanceof TestRow
+            && Objects.equals(((TestRow) other).id, id)
+            && Objects.deepEquals(((TestRow)other).value, value);
+        }
+
+        @Override
+        public String toString() {
+          return id + ", " + Arrays.toString(value);
+        }
+      }
+
+      OracleR2dbcTypes.ArrayType arrayType =
+        OracleR2dbcTypes.arrayType("TEST_OUT_ARRAY");
+      Statement callStatement = connection.createStatement(
+        "BEGIN testOutArrayProcedure(:id, :value); END;");
+
+      // Expect a NULL out parameter before any rows have been inserted
+      awaitQuery(
+        List.of(Optional.empty()),
+        outParameters -> {
+          assertNull(outParameters.get("value"));
+          assertNull(outParameters.get("value", int[].class));
+          assertNull(outParameters.get("value", Integer[].class));
+          return Optional.empty();
+        },
+        callStatement
+          .bind("id", -1)
+          .bind("value", Parameters.out(arrayType)));
+
+      // Insert a row and expect an out parameter with the value
+      TestRow row0 = new TestRow(0L, new Integer[]{1, 2, 3});
+      awaitUpdate(1, connection.createStatement(
+          "INSERT INTO testOutArrayCall VALUES (:id, :value)")
+        .bind("id", row0.id)
+        .bind("value", Parameters.in(arrayType, row0.value)));
+      awaitQuery(
+        List.of(row0),
+        outParameters ->
+          new TestRow(row0.id, outParameters.get("value", Integer[].class)),
+        callStatement
+          .bind("id", row0.id)
+          .bind("value", Parameters.out(arrayType)));
+
+      // Insert another row and expect an out parameter with the value
+      TestRow row1 = new TestRow(1L, new Integer[]{4, 5, 6});
+      awaitUpdate(1, connection.createStatement(
+          "INSERT INTO testOutArrayCall VALUES (:id, :value)")
+        .bind("id", row1.id)
+        .bind("value", Parameters.in(arrayType, row1.value)));
+      awaitQuery(
+        List.of(row1),
+        outParameters ->
+          new TestRow(row1.id, outParameters.get("value", Integer[].class)),
+        callStatement
+          .bind("id", row1.id)
+          .bind("value", Parameters.out(arrayType)));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testOutArrayCall"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testOutArrayProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TYPE TEST_OUT_ARRAY"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior for a PL/SQL call having {@code ARRAY} type OUT bind
+   */
+  @Test
+  public void testInOutArrayCall() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE TEST_IN_OUT_ARRAY AS ARRAY(8) OF NUMBER"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testInOutArrayCall(id NUMBER, value TEST_IN_OUT_ARRAY)"));
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testInOutArrayProcedure (" +
+          "   inId IN NUMBER," +
+          "   inOutArray IN OUT TEST_IN_OUT_ARRAY)" +
+          " IS" +
+          " newValue TEST_IN_OUT_ARRAY;" +
+          " BEGIN" +
+          "" +
+          " newValue := TEST_IN_OUT_ARRAY();" +
+          " newValue.extend(inOutArray.count);" +
+          " FOR i IN 1 .. inOutArray.count LOOP" +
+          "   newValue(i) := inOutArray(i);" +
+          " END LOOP;" +
+          "" +
+          " BEGIN" +
+          "   SELECT value INTO inOutArray" +
+          "     FROM testInOutArrayCall" +
+          "     WHERE id = inId;" +
+          "   DELETE FROM testInOutArrayCall WHERE id = inId;" +
+          "   EXCEPTION" +
+          "     WHEN NO_DATA_FOUND THEN" +
+          "       inOutArray := NULL;" +
+          " END;" +
+          "" +
+          " INSERT INTO testInOutArrayCall VALUES (inId, newValue);" +
+          "" +
+          " END;"));
+
+      class TestRow {
+        Long id;
+        Integer[] value;
+        TestRow(Long id, Integer[] value) {
+          this.id = id;
+          this.value = value;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+          return other instanceof TestRow
+            && Objects.equals(((TestRow) other).id, id)
+            && Objects.deepEquals(((TestRow)other).value, value);
+        }
+
+        @Override
+        public String toString() {
+          return id + ", " + Arrays.toString(value);
+        }
+
+        @Override
+        public int hashCode() {
+          return Objects.hash(id, Arrays.hashCode(value));
+        }
+      }
+
+      OracleR2dbcTypes.ArrayType arrayType =
+        OracleR2dbcTypes.arrayType("TEST_IN_OUT_ARRAY");
+      Statement callStatement = connection.createStatement(
+        "BEGIN testInOutArrayProcedure(:id, :value); END;");
+
+      // Expect a NULL out parameter the first time a row is inserted
+      TestRow row = new TestRow(0L, new Integer[]{1, 2, 3});
+      awaitQuery(
+        List.of(Optional.empty()),
+        outParameters -> {
+          assertNull(outParameters.get("value"));
+          assertNull(outParameters.get("value", int[].class));
+          assertNull(outParameters.get("value", Integer[].class));
+          return Optional.empty();
+        },
+        callStatement
+          .bind("id", row.id)
+          .bind("value", Parameters.inOut(arrayType, row.value)));
+
+      // Update the row and expect an out parameter with the previous value
+      TestRow row1 = new TestRow(row.id, new Integer[]{4, 5, 6});
+      awaitQuery(
+        List.of(row),
+        outParameters ->
+          new TestRow(
+            row.id,
+            outParameters.get("value", Integer[].class)),
+        callStatement
+          .bind("id", row.id)
+          .bind("value", Parameters.inOut(arrayType, row1.value)));
+
+      // Update the row again and expect an out parameter with the previous
+      // value
+      TestRow row2 = new TestRow(row.id, new Integer[]{7, 8, 9});
+      awaitQuery(
+        List.of(row1),
+        outParameters ->
+          new TestRow(
+            row.id,
+            outParameters.get("value", Integer[].class)),
+        callStatement
+          .bind("id", row.id)
+          .bind("value", Parameters.inOut(arrayType, row2.value)));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testInOutArrayCall"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testInOutArrayProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TYPE TEST_IN_OUT_ARRAY"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior for a PL/SQL call having {@code OBJECT} type IN bind
+   */
+  @Test
+  public void testInObjectCall() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE TEST_IN_OBJECT AS OBJECT(x NUMBER, y NUMBER, z NUMBER)"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testInObjectCall(id NUMBER, value TEST_IN_OBJECT)"));
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testInObjectProcedure (" +
+          " id IN NUMBER," +
+          " inObject IN TEST_IN_OBJECT)" +
+          " IS" +
+          " BEGIN" +
+          " INSERT INTO testInObjectCall VALUES(id, inObject);" +
+          " END;"));
+
+      TestObjectRow row0 = new TestObjectRow(0L, new Integer[]{1, 2, 3});
+      OracleR2dbcTypes.ObjectType objectType =
+        OracleR2dbcTypes.objectType("TEST_IN_OBJECT");
+      Statement callStatement = connection.createStatement(
+        "BEGIN testInObjectProcedure(:id, :value); END;");
+      awaitExecution(
+        callStatement
+          .bind("id", row0.id)
+          .bind("value", Parameters.in(objectType, row0.value)));
+
+      awaitQuery(
+        List.of(row0),
+        TestObjectRow::fromReadable,
+        connection.createStatement(
+          "SELECT id, value FROM testInObjectCall ORDER BY id"));
+
+      TestObjectRow row1 = new TestObjectRow(1L, new Integer[]{4, 5, 6});
+      awaitExecution(
+        callStatement
+          .bind("id", row1.id)
+          .bind("value", constructObject(connection, objectType, row1.value)));
+
+      awaitQuery(
+        List.of(row0, row1),
+        TestObjectRow::fromReadable,
+        connection.createStatement(
+          "SELECT id, value FROM testInObjectCall ORDER BY id"));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testInObjectCall"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testInObjectProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TYPE TEST_IN_OBJECT"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior for a PL/SQL call having {@code OBJECT} type OUT bind
+   */
+  @Test
+  public void testOutObjectCall() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE TEST_OUT_OBJECT AS OBJECT(x NUMBER, y NUMBER, z NUMBER)"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testOutObjectCall(id NUMBER, value TEST_OUT_OBJECT)"));
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testOutObjectProcedure (" +
+          "   inId IN NUMBER," +
+          "   outObject OUT TEST_OUT_OBJECT)" +
+          " IS" +
+          " BEGIN" +
+          "   SELECT value INTO outObject" +
+          "     FROM testOutObjectCall" +
+          "     WHERE id = inId;" +
+          " EXCEPTION" +
+          "   WHEN NO_DATA_FOUND THEN" +
+          "     outObject := NULL;" +
+          " END;"));
+
+
+      OracleR2dbcTypes.ObjectType objectType =
+        OracleR2dbcTypes.objectType("TEST_OUT_OBJECT");
+      Statement callStatement = connection.createStatement(
+        "BEGIN testOutObjectProcedure(:id, :value); END;");
+
+      // Expect a NULL out parameter before any rows have been inserted
+      awaitQuery(
+        List.of(Optional.empty()),
+        outParameters -> {
+          assertNull(outParameters.get("value"));
+          assertNull(outParameters.get("value", Object[].class));
+          assertNull(outParameters.get("value", Map.class));
+          assertNull(outParameters.get("value", OracleR2dbcObject.class));
+          return Optional.empty();
+        },
+        callStatement
+          .bind("id", -1)
+          .bind("value", Parameters.out(objectType)));
+
+      // Insert a row and expect an out parameter with the value
+      TestObjectRow row0 = new TestObjectRow(0L, new Integer[]{1, 2, 3});
+      awaitUpdate(1, connection.createStatement(
+          "INSERT INTO testOutObjectCall VALUES (:id, :value)")
+        .bind("id", row0.id)
+        .bind("value", Parameters.in(objectType, row0.value)));
+      awaitQuery(
+        List.of(row0),
+        outParameters ->
+          new TestObjectRow(
+            row0.id,
+            outParameters.get("value", OracleR2dbcObject.class)),
+        callStatement
+          .bind("id", row0.id)
+          .bind("value", Parameters.out(objectType)));
+
+      // Insert another row and expect an out parameter with the value
+      TestObjectRow row1 = new TestObjectRow(1L, new Integer[]{4, 5, 6});
+      awaitUpdate(1, connection.createStatement(
+          "INSERT INTO testOutObjectCall VALUES (:id, :value)")
+        .bind("id", row1.id)
+        .bind("value", constructObject(connection, objectType, row1.value)));
+      awaitQuery(
+        List.of(row1),
+        outParameters ->
+          new TestObjectRow(
+            row1.id,
+            outParameters.get("value", OracleR2dbcObject.class)),
+        callStatement
+          .bind("id", row1.id)
+          .bind("value", Parameters.out(objectType)));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testOutObjectCall"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testOutObjectProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TYPE TEST_OUT_OBJECT"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior for a PL/SQL call having {@code OBJECT} type OUT bind
+   */
+  @Test
+  public void testInOutObjectCall() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE TEST_IN_OUT_OBJECT AS OBJECT(x NUMBER, y NUMBER, z NUMBER)"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testInOutObjectCall(id NUMBER, value TEST_IN_OUT_OBJECT)"));
+      awaitExecution(connection.createStatement(
+        "CREATE OR REPLACE PROCEDURE testInOutObjectProcedure (" +
+          "   inId IN NUMBER," +
+          "   inOutObject IN OUT TEST_IN_OUT_OBJECT)" +
+          " IS" +
+          " newValue TEST_IN_OUT_OBJECT;" +
+          " BEGIN" +
+          "" +
+          /*
+          " newValue := TEST_IN_OUT_OBJECT();" +
+          " newValue.extend(inOutObject.count);" +
+          " FOR i IN 1 .. inOutObject.count LOOP" +
+          "   newValue(i) := inOutObject(i);" +
+          " END LOOP;" +
+          "" +
+           */
+          " newValue := inOutObject;" +
+          " BEGIN" +
+          "   SELECT value INTO inOutObject" +
+          "     FROM testInOutObjectCall" +
+          "     WHERE id = inId;" +
+          "   DELETE FROM testInOutObjectCall WHERE id = inId;" +
+          "   EXCEPTION" +
+          "     WHEN NO_DATA_FOUND THEN" +
+          "       inOutObject := NULL;" +
+          " END;" +
+          "" +
+          " INSERT INTO testInOutObjectCall VALUES (inId, newValue);" +
+          "" +
+          " END;"));
+
+      OracleR2dbcTypes.ObjectType objectType =
+        OracleR2dbcTypes.objectType("TEST_IN_OUT_OBJECT");
+      Statement callStatement = connection.createStatement(
+        "BEGIN testInOutObjectProcedure(:id, :value); END;");
+
+      // Expect a NULL out parameter the first time a row is inserted
+      TestObjectRow row = new TestObjectRow(0L, new Integer[]{1, 2, 3});
+      awaitQuery(
+        List.of(Optional.empty()),
+        outParameters -> {
+          assertNull(outParameters.get("value"));
+          assertNull(outParameters.get("value", Object[].class));
+          assertNull(outParameters.get("value", Map.class));
+          assertNull(outParameters.get("value", OracleR2dbcObject.class));
+          return Optional.empty();
+        },
+        callStatement
+          .bind("id", row.id)
+          .bind("value", Parameters.inOut(objectType, row.value)));
+
+      // Update the row and expect an out parameter with the previous value
+      TestObjectRow row1 = new TestObjectRow(row.id, new Integer[]{4, 5, 6});
+      awaitQuery(
+        List.of(row),
+        outParameters ->
+          new TestObjectRow(
+            row.id,
+            outParameters.get("value", OracleR2dbcObject.class)),
+        callStatement
+          .bind("id", row.id)
+          .bind("value", Parameters.inOut(objectType, constructObject(
+            connection, objectType, row1.value))));
+
+      // Update the row again and expect an out parameter with the previous
+      // value
+      TestObjectRow row2 = new TestObjectRow(row.id, new Integer[]{7, 8, 9});
+      awaitQuery(
+        List.of(row1),
+        outParameters ->
+          new TestObjectRow(
+            row.id,
+            outParameters.get("value", OracleR2dbcObject.class)),
+        callStatement
+          .bind("id", row.id)
+          .bind("value", Parameters.inOut(objectType, Map.of(
+            "x", row2.value[0],
+            "y", row2.value[1],
+            "z", row2.value[2]))));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testInOutObjectCall"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP PROCEDURE testInOutObjectProcedure"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TYPE TEST_IN_OUT_OBJECT"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies OUT parameter binds in a RETURNING INTO clause.
+   */
+  @Test
+  public void testReturnParameter() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testReturnParameter(id NUMBER, value VARCHAR(100))"));
+
+      TestRow insertRow = new TestRow(1, "a");
+      Statement returnStatement = connection.createStatement(
+        "BEGIN" +
+          " INSERT INTO testReturnParameter" +
+          " VALUES (?, ?)" +
+          " RETURNING id, value" +
+          " INTO ?, ?;" +
+          " END;");
+      returnStatement.bind(0, insertRow.id);
+      returnStatement.bind(1, insertRow.value);
+      returnStatement.bind(2, Parameters.out(R2dbcType.NUMERIC));
+      returnStatement.bind(3, Parameters.out(R2dbcType.VARCHAR));
+
+      Result returnResult = awaitOne(returnStatement.execute());
+      TestRow returnRow = awaitOne(returnResult.map(outParameters ->
+        new TestRow(
+          outParameters.get(0, Integer.class),
+          outParameters.get(1, String.class))));
+      assertEquals(insertRow, returnRow);
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testReturnParameter"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies OUT parameter binds in a RETURNING INTO clause with a JSON
+   * Duality View.
+   */
+  @Test
+  public void testReturnParameterJsonDualityView() {
+    // JSON Duality Views were introduced in Oracle Database version 23c, so
+    // this test is skipped if the version is older than 23c.
+    assumeTrue(databaseVersion() >= 23,
+      "JSON Duality Views are not supported by database versions older than" +
+        " 23");
+
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testReturnParameterJsonDualityViewTable(" +
+          "id NUMBER PRIMARY KEY, value VARCHAR(100))"));
+      awaitExecution(connection.createStatement(
+        "CREATE JSON DUALITY VIEW testReturnParameterJsonDualityView AS" +
+          " SELECT JSON {'id' : t.id, 'value' : t.value}" +
+          " FROM testReturnParameterJsonDualityViewTable t" +
+          " WITH INSERT UPDATE DELETE"));
+
+      // Verify returning the "data" column
+      OracleJsonObject insertObject = new OracleJsonFactory().createObject();
+      insertObject.put("id", 1);
+      insertObject.put("value", "a");
+      Statement returnStatement = connection.createStatement(
+        "BEGIN" +
+          " INSERT INTO testReturnParameterJsonDualityView" +
+          " VALUES (?)" +
+          " RETURNING data" +
+          " INTO ?;" +
+          " END;");
+      returnStatement.bind(0, insertObject);
+      returnStatement.bind(1, Parameters.out(OracleR2dbcTypes.JSON));
+
+      Result returnResult = awaitOne(returnStatement.execute());
+      OracleJsonObject returnObject =
+        awaitOne(returnResult.map(outParameters ->
+          outParameters.get(0, OracleJsonObject.class)));
+      insertObject.put("_metadata", returnObject.get("_metadata"));
+      assertEquals(insertObject, returnObject);
+
+      // Verify returning a JSON_VALUE expression
+      OracleJsonObject insertObjectB = new OracleJsonFactory().createObject();
+      insertObjectB.put("id", 2);
+      insertObjectB.put("value", "b");
+      Statement returnStatementB = connection.createStatement(
+        "BEGIN" +
+          " INSERT INTO testReturnParameterJsonDualityView" +
+          " VALUES (?)" +
+          " RETURNING JSON_VALUE(DATA, '$.id')" +
+          " INTO ?;" +
+          " END;");
+      returnStatementB.bind(0, insertObjectB);
+      returnStatementB.bind(1, Parameters.out(R2dbcType.NUMERIC));
+
+      Result returnResultB = awaitOne(returnStatementB.execute());
+      int returnId =
+        awaitOne(returnResultB.map(outParameters ->
+          outParameters.get(0, Integer.class)));
+      assertEquals(insertObjectB.getInt("id"), returnId);
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testReturnParameterJsonDualityViewTable"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP VIEW testReturnParameterJsonDualityView"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies inserts and queries with a JSON Duality View.
+   */
+  @Test
+  public void testJsonDualityView() {
+    // JSON Duality Views were introduced in Oracle Database version 23c, so
+    // this test is skipped if the version is older than 23c.
+    assumeTrue(databaseVersion() >= 23,
+      "JSON Duality Views are not supported by database versions older than" +
+        " 23");
+
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testJsonDualityViewTable (" +
+          "id NUMBER PRIMARY KEY, value VARCHAR(1000))"));
+      awaitExecution(connection.createStatement(
+        "CREATE JSON DUALITY VIEW testJsonDualityView AS" +
+          " SELECT JSON {'id' : t.id, 'value' : t.value}" +
+          " FROM testJsonDualityViewTable t" +
+          " WITH INSERT UPDATE DELETE"));
+
+      // Verify an insert
+      OracleJsonObject insertObject = new OracleJsonFactory().createObject();
+      insertObject.put("id", 1);
+      insertObject.put("value", "a");
+      Statement insert = connection.createStatement(
+        "INSERT INTO testJsonDualityView VALUES (?)")
+        .bind(0, insertObject);
+      awaitUpdate(1, insert);
+
+      // Verify a query
+      Statement query = connection.createStatement(
+        "SELECT data FROM testJsonDualityView");
+      Result queryResult = awaitOne(query.execute());
+      OracleJsonObject queryObject =
+        awaitOne(queryResult.map(row -> row.get(0, OracleJsonObject.class)));
+      queryObject =
+        new OracleJsonFactory().createObject(queryObject);
+      queryObject.remove("_metadata"); // Remove this field for assertEquals
+      assertEquals(insertObject, queryObject);
+
+      // Verify an update that returns generated keys
+      OracleJsonObject updateObject = new OracleJsonFactory().createObject();
+      updateObject.put("id", 1);
+      updateObject.put("value", "b");
+      Statement update = connection.createStatement(
+        "UPDATE testJsonDualityView v" +
+          " SET data = ?" +
+          " WHERE v.data.id = ?");
+      update.bind(0, updateObject);
+      update.bind(1, 1);
+      update.returnGeneratedValues("data");
+      Result updateResult = awaitOne(update.execute());
+      OracleJsonObject generatedUpdateObject =
+        awaitOne(updateResult.map(row -> row.get(0, OracleJsonObject.class)));
+      generatedUpdateObject =
+        new OracleJsonFactory().createObject(generatedUpdateObject);
+      generatedUpdateObject.remove("_metadata"); // Remove this field for assertEquals
+      assertEquals(updateObject, generatedUpdateObject);
+
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP VIEW testJsonDualityView"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testJsonDualityViewTable"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies the case where the VECTOR type descriptor is used to register an
+   * OUT parameter.
+   */
+  @Test
+  public void testVectorOutParameter() throws SQLException {
+    Assumptions.assumeTrue(databaseVersion() >= 23); //  VECTOR is added in 23
+
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testVectorOutParameter (id NUMBER, value VECTOR)"));
+
+      class IdVector {
+        final int id;
+        final VECTOR vector;
+
+        IdVector(int id, VECTOR vector) {
+          this.id = id;
+          this.vector = vector;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+          return other instanceof IdVector
+            && ((IdVector)other).id == id
+            && Objects.equals(((IdVector)other).vector, vector);
+        }
+
+        @Override
+        public int hashCode() {
+          return Objects.hash(id, vector);
+        }
+      }
+
+      // Round 1: Use PL/SQL to return column values
+      IdVector expected1 = new IdVector(
+        0,
+        VECTOR.ofFloat64Values(
+          DoubleStream.iterate(-3.0, previous -> previous + 0.1)
+            .limit(60)
+            .toArray()));
+
+      awaitOne(
+        expected1,
+        Flux.from(connection.createStatement(
+          "BEGIN"
+            + " INSERT INTO testVectorOutParameter VALUES(:inId, :inVector)"
+            + " RETURNING id, value INTO :outId, :outVector;"
+            + " END;")
+          .bind("inId", expected1.id)
+          .bind("inVector", expected1.vector)
+          .bind("outId", Parameters.out(R2dbcType.NUMERIC))
+          .bind("outVector", Parameters.out(OracleR2dbcTypes.VECTOR))
+          .execute())
+          .flatMap(result ->
+            result.map(outParameters ->
+              new IdVector(
+                outParameters.get("outId", Integer.class),
+                outParameters.get("outVector", VECTOR.class)))));
+
+      // Round 2: Use returnGeneratedValues(String...) to return column values
+
+      // Oracle JDBC 23.4 has a defect which prevents the Subscriber from
+      // receiving a terminal signal. The defect has been reported as bug
+      // #36607804, it will be fixed in the 23.6 release.
+      Assumptions.assumeTrue(
+        jdbcMinorVersion() >= 6,
+        "Oracle JDBC 23.5 does not support generated keys for VECTOR");
+
+      IdVector expected2 = new IdVector(
+        0,
+        VECTOR.ofFloat64Values(
+          DoubleStream.iterate(-3.0, previous -> previous + 0.1)
+            .limit(60)
+            .toArray()));
+
+      awaitMany(
+        List.of(/*update count ->*/1L, expected2),
+        Flux.from(connection.createStatement(
+          "INSERT INTO testVectorOutParameter VALUES(:id, :vector)")
+            .bind("id", expected2.id)
+            .bind("vector", expected2.vector)
+            .returnGeneratedValues("id", "value")
+            .execute())
+          .flatMap(result ->
+            result.flatMap(segment -> {
+              if (segment instanceof UpdateCount) {
+                return Mono.just(((UpdateCount) segment).value());
+              }
+              else if (segment instanceof Result.RowSegment) {
+                Row generatedRow = ((Result.RowSegment)segment).row();
+
+                return Mono.just(new IdVector(
+                  generatedRow.get("id", Integer.class),
+                  generatedRow.get("value", VECTOR.class)));
+              }
+              else if (segment instanceof Message) {
+                throw ((Message)segment).exception();
+              }
+              else {
+                throw new AssertionError("Unexpected segment: " + segment);
+              }
+            })));
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testVectorOutParameter"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  @Test
+  public void testVectorReturningExample() {
+    assumeTrue(databaseVersion() >= 23); // VECTOR is not added until 23.4
+
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE example (text CLOB, embedding VECTOR)"));
+
+      double[] expected =
+        DoubleStream.iterate(0, previous -> previous + 1)
+          .limit(999)
+          .toArray();
+
+      double[] actual =
+        awaitOne(returningVectorExample(connection, Arrays.toString(expected)));
+      assertArrayEquals(expected, actual);
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement("DROP TABLE example"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  Publisher<double[]> returningVectorExample(
+    Connection connection, String vectorString) {
+
+    Statement statement = connection.createStatement(
+      "BEGIN INSERT INTO example(embedding)"
+        + " VALUES (TO_VECTOR(:vectorString, 999, FLOAT64))"
+        + " RETURNING embedding INTO :embedding;"
+        + " END;")
+      .bind("vectorString", vectorString)
+      .bind("embedding", Parameters.out(OracleR2dbcTypes.VECTOR));
+
+    return Flux.from(statement.execute())
+      .flatMap(result ->
+        result.map(outParameters ->
+            outParameters.get("embedding", double[].class)));
+  }
+
+  Publisher<double[]> returningVectorExample0(Connection connection, String text) {
+    return Flux.from(connection.createStatement(
+          "BEGIN"
+            + " INSERT INTO example(text, embedding) VALUES("
+            +"   :text,"
+            +"   TO_VECTOR(VECTOR_EMBEDDING(doc_model USING :text as data)))"
+            +" RETURNING embedding INTO :embedding;"
+            + " END;")
+        .bind("text", text)
+        .bind("embedding", Parameters.out(OracleR2dbcTypes.VECTOR))
+        .execute())
+      .flatMap(result->
+        result.map(outParameters->
+          outParameters.get("outVector", double[].class)));
+  }
+
+  /**
+   * Connect to the database configured by {@link DatabaseConfig}, with a
+   * connection configured to use a given {@code executor} for async
+   * callbacks.
+   * connection configured to use a given {@code executor} for async callbacks.
+   * @param executor Executor for async callbacks
+   * @return Connection that uses the {@code executor}
+   */
+  private static Publisher<? extends Connection> connect(Executor executor) {
+    return ConnectionFactories.get(connectionFactoryOptions()
+      .mutate()
+      .option(OracleR2dbcOptions.EXECUTOR, executor)
+      .build())
+      .create();
+  }
+
+  /**
+   * Verifies concurrent statement execution the given {@code connection}
+   * @param connection Connection to verify
+   */
+  private void verifyConcurrentExecute(Connection connection) {
+
+    // Create many statements and execute them in parallel.
+    @SuppressWarnings({"unchecked","rawtypes"})
+    Publisher<Integer>[] publishers =
+      new Publisher[Runtime.getRuntime().availableProcessors() * 4];
+
+    for (int i = 0; i < publishers.length; i++) {
+      Flux<Integer> flux = Flux.from(connection.createStatement(
+            "SELECT " + i + " FROM sys.dual")
+          .execute())
+        .flatMap(result ->
+          result.map(row -> row.get(0, Integer.class)))
+        .cache();
+
+      flux.subscribe();
+      publishers[i] = flux;
+    }
+
+    awaitMany(
+      IntStream.range(0, publishers.length)
+        .boxed()
+        .collect(Collectors.toList()),
+      Flux.concat(publishers));
+  }
+
+  /**
+   * Verifies concurrent row fetching with the given {@code connection}
+   * @param connection Connection to verify
+   */
+  private void verifyConcurrentFetch(Connection connection) {
+    connection.setStatementTimeout(DatabaseConfig.sqlTimeout());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testConcurrentFetch (value NUMBER)"));
+
+      // Create many statements and execute them in parallel.
+      @SuppressWarnings({"unchecked","rawtypes"})
+      Publisher<Long>[] publishers =
+        new Publisher[Runtime.getRuntime().availableProcessors() * 2];
+
+      for (int i = 0; i < publishers.length; i++) {
+
+        Statement statement = connection.createStatement(
+          "INSERT INTO testConcurrentFetch VALUES (?)");
+
+        // Each publisher batch inserts a range of 10 values
+        int start = i * 10;
+        statement.bind(0, start);
+        IntStream.range(start + 1, start + 10)
+          .forEach(value -> {
+            statement.add().bind(0, value);
+          });
+
+        Mono<Long> mono = Flux.from(statement.execute())
+          .flatMap(Result::getRowsUpdated)
+          .collect(Collectors.summingLong(Long::longValue))
+          .cache();
+
+        // Execute in parallel, and retain the result for verification later
+        mono.subscribe();
+        publishers[i] = mono;
+      }
+
+      // Expect each publisher to emit an update count of 100
+      awaitMany(
+        Stream.generate(() -> 10L)
+          .limit(publishers.length)
+          .collect(Collectors.toList()),
+        Flux.merge(publishers));
+
+      // Create publishers that fetch rows in parallel
+      @SuppressWarnings({"unchecked","rawtypes"})
+      Publisher<List<Integer>>[] fetchPublishers =
+        new Publisher[publishers.length];
+
+      for (int i = 0; i < fetchPublishers.length; i++) {
+        Mono<List<Integer>> mono = Flux.from(connection.createStatement(
+              "SELECT value FROM testConcurrentFetch ORDER BY value")
+            .execute())
+          .flatMap(result ->
+            result.map(row -> row.get(0, Integer.class)))
+          .sort()
+          .collect(Collectors.toList())
+          .cache();
+
+        // Execute in parallel, and retain the result for verification later
+        mono.subscribe();
+        fetchPublishers[i] = mono;
+      }
+
+      // Expect each fetch publisher to get the same result
+      List<Integer> expected = IntStream.range(0, publishers.length * 10)
+        .boxed()
+        .collect(Collectors.toList());
+
+      for (Publisher<List<Integer>> publisher : fetchPublishers)
+        awaitOne(expected, publisher);
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testConcurrentFetch"));
+    }
+  }
+
+  /**
+   * Creates list of a specified length of test table rows
+   */
+  private static List<TestRow> createRows(int length) {
+    return IntStream.range(0, 100)
+      .mapToObj(id -> new TestRow(id, String.valueOf(id)))
+      .collect(Collectors.toList());
+  }
+
+  /** Binds a list of rows to a batch statement */
+  private Statement bindRows(List<TestRow> rows, Statement statement) {
+    rows.stream()
+      .limit(rows.size() - 1)
+      .forEach(row ->
+        statement
+          .bind("id", row.id)
+          .bind("value", row.value)
+          .add());
+
+    statement
+      .bind("id", rows.get(rows.size() - 1).id)
+      .bind("value", rows.get(rows.size() - 1).value);
+
+    return statement;
+  }
+
+  /**
+   * A row of a test table.
+   */
+  private static class TestRow {
+    final int id;
+    final String value;
+
+    TestRow(int id, String value) {
+      this.id = id;
+      this.value = value;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      return other instanceof TestRow
+        && id == ((TestRow)other).id
+        && Objects.equals(value, ((TestRow)other).value);
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(id, value);
+    }
+
+    @Override
+    public String toString() {
+      return "[id=" + id + ", value=" + value + "]";
+    }
+  }
+
+  private static class TestObjectRow {
+    Long id;
+    Object[] value;
+    TestObjectRow(Long id, OracleR2dbcObject object) {
+      this(id, new Integer[] {
+        object.get("x", Integer.class),
+        object.get("y", Integer.class),
+        object.get("z", Integer.class)
       });
     }
 
-    InOutParameter(Object value, Type type) {
+    TestObjectRow(Long id, Object[] value) {
+      this.id = id;
       this.value = value;
-      this.type = type;
+    }
+
+    static TestObjectRow fromReadable(io.r2dbc.spi.Readable row) {
+      return new TestObjectRow(
+        row.get("id", Long.class),
+        row.get("value", OracleR2dbcObject.class));
     }
 
     @Override
-    public Type getType() {
-      return type;
+    public boolean equals(Object other) {
+      return other instanceof TestObjectRow
+        && Objects.equals(((TestObjectRow) other).id, id)
+        && Arrays.equals(((TestObjectRow)other).value, value);
     }
 
     @Override
-    public Object getValue() {
-      return value;
+    public int hashCode() {
+      return Objects.hash(id, value);
+    }
+
+    @Override
+    public String toString() {
+      return id + ", " + Arrays.toString(value);
     }
   }
 }

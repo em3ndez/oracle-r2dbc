@@ -24,18 +24,33 @@ package oracle.r2dbc.impl;
 import io.r2dbc.spi.Blob;
 import io.r2dbc.spi.Clob;
 import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.ConnectionFactories;
+import io.r2dbc.spi.Parameters;
 import io.r2dbc.spi.Row;
 import io.r2dbc.spi.Statement;
+import oracle.r2dbc.OracleR2dbcObject;
+import oracle.r2dbc.OracleR2dbcTypes;
+import oracle.r2dbc.test.DatabaseConfig;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
+import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.r2dbc.spi.ConnectionFactoryOptions.HOST;
+import static io.r2dbc.spi.ConnectionFactoryOptions.PORT;
+import static java.nio.charset.StandardCharsets.US_ASCII;
 import static java.util.Arrays.asList;
 import static oracle.r2dbc.test.DatabaseConfig.connectTimeout;
 import static oracle.r2dbc.test.DatabaseConfig.sharedConnection;
@@ -43,15 +58,17 @@ import static oracle.r2dbc.util.Awaits.awaitExecution;
 import static oracle.r2dbc.util.Awaits.awaitMany;
 import static oracle.r2dbc.util.Awaits.awaitNone;
 import static oracle.r2dbc.util.Awaits.awaitOne;
+import static oracle.r2dbc.util.Awaits.awaitQuery;
 import static oracle.r2dbc.util.Awaits.awaitUpdate;
 import static oracle.r2dbc.util.Awaits.tryAwaitExecution;
 import static oracle.r2dbc.util.Awaits.tryAwaitNone;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Verifies the Oracle R2DBC Driver implements behavior related to {@link Blob}
- * and {@link Clob} types that is specified in it's class and method level
+ * and {@link Clob} types that is specified in its class and method level
  * javadocs, in the javadocs of {@code Blob} and {@code Clob}, and in Section
  * 12 of the R2DBC 0.8.2 Specification.
  */
@@ -353,7 +370,7 @@ public class OracleLargeObjectsTest {
 
       // Expect row.get(int/String) to use Clob as the default Java type
       // mapping for CLOB type columns.
-      List<List<Clob>> Clobs = awaitMany(Flux.from(connection.createStatement(
+      List<List<Clob>> clobs = awaitMany(Flux.from(connection.createStatement(
         "SELECT x,y FROM testClobInsert ORDER BY id")
         .execute())
         .flatMap(result -> result.map((row, metadata) ->
@@ -361,15 +378,398 @@ public class OracleLargeObjectsTest {
 
       // Expect bytes written to INSERTed Clobs to match the bytes read from
       // SELECTed Clobs
-      awaitBytes(xBytes0, Clobs.get(0).get(0));
-      awaitBytes(yBytes0, Clobs.get(0).get(1));
-      awaitBytes(xBytes1, Clobs.get(1).get(0));
-      awaitBytes(yBytes1, Clobs.get(1).get(1));
+      awaitBytes(xBytes0, clobs.get(0).get(0));
+      awaitBytes(yBytes0, clobs.get(0).get(1));
+      awaitBytes(xBytes1, clobs.get(1).get(0));
+      awaitBytes(yBytes1, clobs.get(1).get(1));
 
     }
     finally {
       tryAwaitExecution(connection.createStatement("DROP TABLE testClobInsert"));
       tryAwaitNone(connection.close());
+    }
+  }
+
+  @Test
+  public void testBlobObject() {
+    Connection connection =
+      Mono.from(sharedConnection()).block(connectTimeout());
+    OracleR2dbcTypes.ObjectType objectType =
+      OracleR2dbcTypes.objectType("BLOB_OBJECT");
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE BLOB_OBJECT AS OBJECT(x BLOB, y BLOB)"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testBlobObject(id NUMBER, blobs BLOB_OBJECT)"));
+      byte[] xBytes0 = getBytes(64 * 1024);
+      byte[] yBytes0 = getBytes(64 * 1024);
+      byte[] xBytes1 = getBytes(64 * 1024);
+      byte[] yBytes1 = getBytes(64 * 1024);
+
+      // Verify asynchronous materialization of Blob binds. The Blob lengths
+      // are each large enough to require multiple Blob writing network calls
+      // by the Oracle JDBC Driver.
+      awaitUpdate(asList(1, 1), connection.createStatement(
+          "INSERT INTO testBlobObject (id, blobs) VALUES (:id, :blobs)")
+        .bind("id", 0)
+        .bind("blobs", Parameters.in(objectType, new Object[]{
+          createBlob(xBytes0),
+          createBlob(yBytes0),
+        }))
+        .add()
+        .bind("id", 1)
+        .bind("blobs", Parameters.in(objectType, Map.of(
+          "x", createBlob(xBytes1),
+          "y", createBlob(yBytes1)))));
+
+      // Expect OracleR2dbcObject.get(int/String) to support Blob as a Java type
+      // mapping for BLOB type attributes.
+      List<List<Blob>> blobs =
+        awaitMany(Flux.from(connection.createStatement(
+              "SELECT blobs FROM testBlobObject ORDER BY id")
+            .execute())
+          .flatMap(result ->
+            result.map(row ->
+              row.get("blobs", OracleR2dbcObject.class)))
+          .map(blobObject -> List.of(
+            blobObject.get("x", Blob.class),
+            blobObject.get("y", Blob.class))));
+
+      // Expect bytes written to INSERTed Blobs to match the bytes read from
+      // SELECTed Blobs
+      awaitBytes(xBytes0, blobs.get(0).get(0));
+      awaitBytes(yBytes0, blobs.get(0).get(1));
+      awaitBytes(xBytes1, blobs.get(1).get(0));
+      awaitBytes(yBytes1, blobs.get(1).get(1));
+
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testBlobObject"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP type " + objectType.getName()));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  @Test
+  public void testClobObject() {
+    Connection connection =
+      Mono.from(sharedConnection()).block(connectTimeout());
+    OracleR2dbcTypes.ObjectType objectType =
+      OracleR2dbcTypes.objectType("CLOB_OBJECT");
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TYPE CLOB_OBJECT AS OBJECT(x CLOB, y CLOB)"));
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testClobObject(id NUMBER, clobs CLOB_OBJECT)"));
+      byte[] xBytes0 = getBytes(64 * 1024);
+      byte[] yBytes0 = getBytes(64 * 1024);
+      byte[] xBytes1 = getBytes(64 * 1024);
+      byte[] yBytes1 = getBytes(64 * 1024);
+
+      // Verify asynchronous materialization of Clob binds. The Clob lengths
+      // are each large enough to require multiple Clob writing network calls
+      // by the Oracle JDBC Driver.
+      awaitUpdate(asList(1, 1), connection.createStatement(
+          "INSERT INTO testClobObject (id, clobs) VALUES (:id, :clobs)")
+        .bind("id", 0)
+        .bind("clobs", Parameters.in(objectType, new Object[]{
+          createClob(xBytes0),
+          createClob(yBytes0),
+        }))
+        .add()
+        .bind("id", 1)
+        .bind("clobs", Parameters.in(objectType, Map.of(
+          "x", createClob(xBytes1),
+          "y", createClob(yBytes1)))));
+
+      // Expect OracleR2dbcObject.get(int/String) to support Clob as a Java type
+      // mapping for CLOB type attributes.
+      List<List<Clob>> clobs =
+        awaitMany(Flux.from(connection.createStatement(
+          "SELECT clobs FROM testClobObject ORDER BY id")
+          .execute())
+          .flatMap(result ->
+            result.map(row ->
+              row.get("clobs", OracleR2dbcObject.class)))
+          .map(clobObject -> List.of(
+            clobObject.get("x", Clob.class),
+            clobObject.get("y", Clob.class))));
+
+      // Expect bytes written to INSERTed Clobs to match the bytes read from
+      // SELECTed Clobs
+      awaitBytes(xBytes0, clobs.get(0).get(0));
+      awaitBytes(yBytes0, clobs.get(0).get(1));
+      awaitBytes(xBytes1, clobs.get(1).get(0));
+      awaitBytes(yBytes1, clobs.get(1).get(1));
+
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testClobObject"));
+      tryAwaitExecution(connection.createStatement(
+        "DROP type " + objectType.getName()));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies behavior around discarding LOBs.
+   *
+   * A Blob/Clob bind should not be discarded until a user calls discard() and
+   * subscribes. Oracle R2DBC used to call discard() itself on Blob/Clob binds,
+   * which is not correct.
+   *
+   * When Connection.close() is called and subscribed to, it should not fail
+   * due to Oracle JDBC bug #37160069 which requires all LOBs to be freed before
+   * closeAsyncOracle is called.
+   */
+  @Test
+  public void testLobDiscard() {
+    byte[] data = getBytes(64 * 1024);
+
+    class TestBlob implements Blob {
+      final ByteBuffer blobData = ByteBuffer.wrap(data);
+
+      boolean isDiscarded = false;
+
+      @Override
+      public Publisher<ByteBuffer> stream() {
+        return Mono.just(blobData);
+      }
+
+      @Override
+      public Publisher<Void> discard() {
+        return Mono.<Void>empty()
+          .doOnSuccess(nil -> isDiscarded = true);
+      }
+    }
+
+    class TestClob implements Clob {
+      final CharBuffer clobData =
+        CharBuffer.wrap(new String(data, US_ASCII));
+
+      boolean isDiscarded = false;
+
+      @Override
+      public Publisher<CharSequence> stream() {
+        return Mono.just(clobData);
+      }
+
+      @Override
+      public Publisher<Void> discard() {
+        return Mono.<Void>empty()
+          .doOnSuccess(nil -> isDiscarded = true);
+      }
+    }
+
+    Connection connection =
+      Mono.from(DatabaseConfig.newConnection()).block(connectTimeout());
+    try {
+      awaitExecution(
+        connection.createStatement(
+          "CREATE TABLE testLobDiscard (blobValue BLOB, clobValue CLOB)"));
+
+      // Verify that LOBs are not discarded until discard() is subscribed to
+      TestBlob testBlob = new TestBlob();
+      TestClob testClob = new TestClob();
+      awaitUpdate(1, connection.createStatement(
+        "INSERT INTO testLobDiscard VALUES (?, ?)")
+        .bind(0, testBlob)
+        .bind(1, testClob));
+      assertFalse(testBlob.isDiscarded);
+      assertFalse(testClob.isDiscarded);
+      awaitNone(testBlob.discard());
+      awaitNone(testClob.discard());
+      assertTrue(testBlob.isDiscarded);
+      assertTrue(testClob.isDiscarded);
+
+      // Query temporary LOBs, and don't discard them
+      Object[] blobAndClob =
+        awaitOne(Flux.from(connection.createStatement(
+          "SELECT TO_BLOB(HEXTORAW('ABCDEF')), TO_CLOB('ABCDEF') FROM sys.dual")
+          .execute())
+          .flatMap(result ->
+            result.map(row ->
+              new Object[]{
+                row.get(0, Blob.class),
+                row.get(1, Clob.class)})));
+
+      awaitExecution(connection.createStatement(
+        "DROP TABLE testLobDiscard"));
+
+      // Close the connection. It should not fail due to Oracle JDBC bug
+      // #37160069.
+      awaitNone(connection.close());
+    }
+    catch (Exception exception) {
+      try {
+        tryAwaitExecution(connection.createStatement(
+          "DROP TABLE testLobDiscard"));
+        tryAwaitNone(connection.close());
+      }
+      catch (Exception closeException) {
+        exception.addSuppressed(closeException);
+      }
+      throw exception;
+    }
+  }
+
+  /**
+   * Verifies inserts and selects on NULL valued BLOBs and CLOBs
+   */
+  @Test
+  public void testNullLob() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      awaitExecution(connection.createStatement(
+        "CREATE TABLE testNullLob(blobValue BLOB, clobValue CLOB)"));
+
+      awaitUpdate(1, connection.createStatement(
+        "INSERT INTO testNullLob VALUES (?, ?)")
+        .bindNull(0, Blob.class)
+        .bindNull(1, Clob.class));
+
+      awaitQuery(
+        List.of(
+          Arrays.asList(null, null)),
+        row -> Arrays.asList(
+          row.get(0, Blob.class),
+          row.get(1, Clob.class)),
+        connection.createStatement(
+          "SELECT blobValue, clobValue FROM testNullLob"));
+
+    }
+    finally {
+      tryAwaitExecution(connection.createStatement(
+        "DROP TABLE testNullLob"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies that the default LOB prefetch size is at least large enough to
+   * fully prefetch 1MB of data.
+   */
+  @Test
+  public void testDefaultLobPrefetch() throws Exception {
+    Assumptions.assumeTrue(
+      null == DatabaseConfig.protocol(), "Test requires TCP protocol");
+
+    // A local server will monitor network I/O
+    try (ServerSocketChannel localServer = ServerSocketChannel.open()) {
+      localServer.configureBlocking(true);
+      localServer.bind(null);
+
+      class TestThread extends Thread {
+
+        /** Count of bytes exchanged between JDBC and the database */
+        int ioCount = 0;
+
+        @Override
+        public void run() {
+          InetSocketAddress databaseAddress =
+            new InetSocketAddress(DatabaseConfig.host(), DatabaseConfig.port());
+
+          try (
+            SocketChannel jdbcChannel = localServer.accept();
+            SocketChannel databaseChannel =
+              SocketChannel.open(databaseAddress)){
+
+            jdbcChannel.configureBlocking(false);
+            databaseChannel.configureBlocking(false);
+
+            ByteBuffer byteBuffer = ByteBuffer.allocateDirect(8192);
+            while (true) {
+
+              byteBuffer.clear();
+              if (-1 == jdbcChannel.read(byteBuffer))
+                break;
+              byteBuffer.flip();
+              ioCount += byteBuffer.remaining();
+
+              while (byteBuffer.hasRemaining())
+                databaseChannel.write(byteBuffer);
+
+              byteBuffer.clear();
+              databaseChannel.read(byteBuffer);
+              byteBuffer.flip();
+              ioCount += byteBuffer.remaining();
+
+              while (byteBuffer.hasRemaining())
+                jdbcChannel.write(byteBuffer);
+            }
+          }
+          catch (Exception exception) {
+            exception.printStackTrace();
+          }
+        }
+      }
+
+      TestThread testThread = new TestThread();
+      testThread.start();
+
+
+      int lobSize = 99 + (1024 * 1024); // <-- 99 + 1MB
+      Connection connection = awaitOne(ConnectionFactories.get(
+        DatabaseConfig.connectionFactoryOptions()
+          .mutate()
+          .option(HOST, "localhost")
+          .option(PORT,
+            ((InetSocketAddress)localServer.getLocalAddress()).getPort())
+          .build())
+        .create());
+      try {
+        awaitExecution(connection.createStatement(
+          "CREATE TABLE testLobPrefetch ("
+            + " id NUMBER GENERATED ALWAYS AS IDENTITY,"
+            + " blobValue BLOB,"
+            + " clobValue CLOB,"
+            + " PRIMARY KEY(id))"));
+
+        // Insert two rows of LOBs larger than 1MB
+        byte[] bytes = getBytes(lobSize);
+        ByteBuffer blobValue = ByteBuffer.wrap(bytes);
+        String clobValue = new String(bytes, US_ASCII);
+        awaitUpdate(List.of(1,1), connection.createStatement(
+          "INSERT INTO testLobPrefetch (blobValue, clobValue)"
+            + " VALUES (:blobValue, :clobValue)")
+          .bind("blobValue", blobValue)
+          .bind("clobValue", clobValue)
+          .add()
+          .bind("blobValue", blobValue)
+          .bind("clobValue", clobValue));
+
+        // Query two rows of LOBs larger than 1MB
+        awaitQuery(
+          List.of(
+            List.of(blobValue, clobValue),
+            List.of(blobValue, clobValue)),
+          row -> {
+            try {
+              // Expect no I/O to result from mapping a fully prefetched BLOB or
+              // CLOB:
+              int ioCount = testThread.ioCount;
+              var result = List.of(row.get("blobValue"), row.get("clobValue"));
+              assertEquals(ioCount, testThread.ioCount);
+              return result;
+            }
+            catch (Exception exception) {
+              throw new RuntimeException(exception);
+            }
+          },
+          connection.createStatement(
+            "SELECT blobValue, clobValue FROM testLobPrefetch ORDER BY id")
+            .fetchSize(1));
+      }
+      finally {
+        tryAwaitExecution(connection.createStatement(
+          "DROP TABLE testLobPrefetch"));
+        tryAwaitNone(connection.close());
+        testThread.join(10_000);
+        testThread.interrupt();
+      }
     }
   }
 

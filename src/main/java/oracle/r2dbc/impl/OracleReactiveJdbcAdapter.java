@@ -38,7 +38,6 @@ import oracle.r2dbc.impl.OracleR2dbcExceptions.JdbcSupplier;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
-import reactor.core.publisher.DirectProcessor;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -54,29 +53,28 @@ import java.sql.Wrapper;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Objects;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Flow;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.stream.Stream;
 
 import static io.r2dbc.spi.ConnectionFactoryOptions.CONNECT_TIMEOUT;
 import static io.r2dbc.spi.ConnectionFactoryOptions.DATABASE;
 import static io.r2dbc.spi.ConnectionFactoryOptions.HOST;
 import static io.r2dbc.spi.ConnectionFactoryOptions.PASSWORD;
 import static io.r2dbc.spi.ConnectionFactoryOptions.PORT;
+import static io.r2dbc.spi.ConnectionFactoryOptions.PROTOCOL;
 import static io.r2dbc.spi.ConnectionFactoryOptions.SSL;
 import static io.r2dbc.spi.ConnectionFactoryOptions.USER;
 import static oracle.r2dbc.impl.OracleR2dbcExceptions.fromJdbc;
 import static oracle.r2dbc.impl.OracleR2dbcExceptions.runJdbc;
 import static oracle.r2dbc.impl.OracleR2dbcExceptions.toR2dbcException;
 import static org.reactivestreams.FlowAdapters.toFlowPublisher;
-import static org.reactivestreams.FlowAdapters.toFlowSubscriber;
 import static org.reactivestreams.FlowAdapters.toPublisher;
+import static org.reactivestreams.FlowAdapters.toSubscriber;
 
 /**
  * <p>
@@ -104,7 +102,7 @@ import static org.reactivestreams.FlowAdapters.toPublisher;
  *     Connection without blocking a thread. Oracle JDBC implements thread
  *     safety by blocking threads, and this can cause deadlocks in common
  *     R2DBC programming scenarios. See the JavaDoc of
- *     {@link UsingConnectionSubscriber} for more details.
+ *     {@link AsyncLockImpl} for more details.
  *   </li>
  * </ul><p>
  * A instance of this class is obtained by invoking {@link #getInstance()}. A
@@ -125,89 +123,22 @@ import static org.reactivestreams.FlowAdapters.toPublisher;
  */
 final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
 
-  /**
-   * The set of JDBC connection properties that this adapter supports. Each
-   * property in this set is represented as an {@link Option} having the name
-   * of the supported JDBC connection property. When a property is configured
-   * with a sensitive value, such as a password, it is represented in this
-   * set as a {@linkplain Option#sensitiveValueOf(String) sensitive Option}.
-   * If a new Option is added to this set, then it <i>must</i> be documented
-   * in the javadoc of {@link #createDataSource(ConnectionFactoryOptions)},
-   * and in any other reference that lists which options the Oracle R2DBC Driver
-   * supports. Undocumented options are useless; Other programmers won't be
-   * able to use an option if they have no way to understand what the option
-   * does or how it should be configured.
-   */
-  private static final Set<Option<CharSequence>>
-    JDBC_CONNECTION_PROPERTY_OPTIONS = Set.of(
-
-      // Support TNS_ADMIN (tnsnames.ora, ojdbc.properties).
-      OracleR2dbcOptions.TNS_ADMIN,
-
-      // Support wallet properties for TCPS/SSL/TLS
-      OracleR2dbcOptions.TLS_WALLET_LOCATION,
-      OracleR2dbcOptions.TLS_WALLET_PASSWORD,
-
-      // Support keystore properties for TCPS/SSL/TLS
-      OracleR2dbcOptions.TLS_KEYSTORE,
-      OracleR2dbcOptions.TLS_KEYSTORE_TYPE,
-      Option.sensitiveValueOf(
-        OracleConnection
-          .CONNECTION_PROPERTY_THIN_JAVAX_NET_SSL_KEYSTOREPASSWORD),
-
-      // Support truststore properties for TCPS/SSL/TLS
-      OracleR2dbcOptions.TLS_TRUSTSTORE,
-      OracleR2dbcOptions.TLS_TRUSTSTORE_TYPE,
-      OracleR2dbcOptions.TLS_TRUSTSTORE_PASSWORD,
-
-      // Support authentication services (RADIUS, KERBEROS, and TCPS)
-      OracleR2dbcOptions.AUTHENTICATION_SERVICES,
-
-      // Support fine grained configuration for TCPS/SSL/TLS
-      OracleR2dbcOptions.TLS_CERTIFICATE_ALIAS,
-      OracleR2dbcOptions.TLS_SERVER_DN_MATCH,
-      OracleR2dbcOptions.TLS_SERVER_CERT_DN,
-      OracleR2dbcOptions.TLS_VERSION,
-      OracleR2dbcOptions.TLS_CIPHER_SUITES,
-      OracleR2dbcOptions.TLS_KEYMANAGERFACTORY_ALGORITHM,
-      OracleR2dbcOptions.TLS_TRUSTMANAGERFACTORY_ALGORITHM,
-      OracleR2dbcOptions.SSL_CONTEXT_PROTOCOL,
-
-      // Because of bug 32378754, the FAN support in the driver may cause a 10s
-      // delay to connect. As a workaround the following property can be set
-      // to false to disable FAN support in the driver.
-      OracleR2dbcOptions.FAN_ENABLED,
-
-      // Support statement cache configuration
-      OracleR2dbcOptions.IMPLICIT_STATEMENT_CACHE_SIZE,
-
-      // Support LOB prefetch size configuration. A large size is configured
-      // by default to support cases where memory is available to store entire
-      // LOB values. A non-default size may be configured when LOB values are
-      // too large to be prefetched and must be streamed from Blob/Clob objects.
-      OracleR2dbcOptions.DEFAULT_LOB_PREFETCH_SIZE,
-
-      // Allow out-of-band (OOB) breaks to be disabled. Oracle JDBC uses OOB
-      // breaks to interrupt a SQL call after a timeout expires. This option 
-      // may need to be disabled when connecting to an 18.x database. Starting
-      // in 19.x, the database can detect when it's running on a system where
-      // OOB is not supported and automatically disable OOB. This automated 
-      // detection is not implemented in 18.x.
-      OracleR2dbcOptions.DISABLE_OUT_OF_BAND_BREAK,
-
-      // Allow the client-side ResultSet cache to be disabled. It is
-      // necessary to do so when using the serializable transaction isolation
-      // level in order to prevent phantom reads.
-      OracleR2dbcOptions.ENABLE_QUERY_RESULT_CACHE
-    );
-
   /** Guards access to a JDBC {@code Connection} created by this adapter */
-  private final AsyncLock asyncLock = new AsyncLock();
+  private final AsyncLock asyncLock;
 
   /**
    * Used to construct the instances of this class.
    */
-  private OracleReactiveJdbcAdapter() { }
+  private OracleReactiveJdbcAdapter() {
+    int driverVersion = new oracle.jdbc.OracleDriver().getMajorVersion();
+
+    // Since 23.1, Oracle JDBC no longer blocks threads during asynchronous
+    // calls. Use the no-op implementation of AsyncLock if the driver is 23 or
+    // newer.
+     asyncLock = driverVersion < 23
+       ? new AsyncLockImpl()
+       : new NoOpAsyncLock();
+  }
 
   /**
    * Returns an instance of this adapter.
@@ -250,7 +181,7 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
    *   jdbc:oracle:thin:@HOST:PORT/DATABASE
    * </pre><p>
    * Alternatively, the host, port, and service name may be specified using an
-   * <a href="https://docs.oracle.com/en/database/oracle/oracle-database/21/netag/identifying-and-accessing-database.html#GUID-8D28E91B-CB72-4DC8-AEFC-F5D583626CF6"></a>
+   * <a href="https://docs.oracle.com/en/database/oracle/oracle-database/21/netag/identifying-and-accessing-database.html#GUID-8D28E91B-CB72-4DC8-AEFC-F5D583626CF6">
    * Oracle Net Descriptor</a>. The descriptor may be set as the value of an
    * {@link Option} having the name "descriptor". When the descriptor option is
    * present, the JDBC URL is composed as:
@@ -379,16 +310,26 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
    *   </li><li>
    *   {@linkplain OracleConnection#CONNECTION_PROPERTY_IMPLICIT_STATEMENT_CACHE_SIZE
    *     oracle.jdbc.implicitStatementCacheSize}
+   *   </li><li>
+   *   {@linkplain OracleConnection#CONNECTION_PROPERTY_THIN_VSESSION_OSUSER
+   *     v$session.osuser}
+   *   </li><li>
+   *   {@linkplain OracleConnection#CONNECTION_PROPERTY_THIN_VSESSION_TERMINAL
+   *     v$session.terminal}
+   *   </li><li>
+   *   {@linkplain OracleConnection#CONNECTION_PROPERTY_THIN_VSESSION_PROCESS
+   *     v$session.process}
+   *   </li><li>
+   *   {@linkplain OracleConnection#CONNECTION_PROPERTY_THIN_VSESSION_PROGRAM
+   *     v$session.program}
+   *   </li><li>
+   *   {@linkplain OracleConnection#CONNECTION_PROPERTY_THIN_VSESSION_MACHINE
+   *     v$session.machine}
+   *   </li><li>
+   *   {@linkplain OracleConnection#CONNECTION_PROPERTY_TIMEZONE_AS_REGION
+   *     oracle.jdbc.timezoneAsRegion}
    *   </li>
    * </ul>
-   *
-   * @implNote The returned {@code DataSource} is configured to create
-   * connections that encode character bind values using the National
-   * Character Set of an Oracle Database. In 21c, the National Character Set
-   * must be either UTF-8 or UTF-16; This ensures that unicode bind data is
-   * properly encoded by Oracle JDBC. If the data source is not configured
-   * this way, the Oracle JDBC Driver uses the default character set of the
-   * database, which may not support Unicode characters.
    *
    * @throws IllegalArgumentException If the {@code oracleNetDescriptor}
    * {@code Option} is provided with any other options that might have
@@ -398,7 +339,7 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
   public DataSource createDataSource(ConnectionFactoryOptions options) {
 
     OracleDataSource oracleDataSource =
-      fromJdbc(oracle.jdbc.pool.OracleDataSource::new);
+      fromJdbc(oracle.jdbc.datasource.impl.OracleDataSource::new);
 
     runJdbc(() -> oracleDataSource.setURL(composeJdbcUrl(options)));
     configureStandardOptions(oracleDataSource, options);
@@ -409,9 +350,30 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
   }
 
   /**
+   * <p>
    * Composes an Oracle JDBC URL from {@code ConnectionFactoryOptions}, as
    * specified in the javadoc of
    * {@link #createDataSource(ConnectionFactoryOptions)}
+   * </p><p>
+   * For consistency with the Oracle JDBC URL, an Oracle R2DBC URL might include
+   * multiple space separated LDAP addresses, where the space is percent encoded,
+   * like this:
+   * <pre>
+   * r2dbc:oracle:ldap://example.com:3500/cn=salesdept,cn=OracleContext,dc=com/salesdb%20ldap://example.com:3500/cn=salesdept,cn=OracleContext,dc=com/salesdb
+   * </pre>
+   * The %20 encoding of the space character must be used in order for
+   * {@link ConnectionFactoryOptions#parse(CharSequence)} to recognize the URL
+   * syntax. When multiple addresses are specified this way, the {@code DATABASE}
+   * option will have the value of:
+   * <pre>
+   * cn=salesdept,cn=OracleContext,dc=com/salesdb ldap://example.com:3500/cn=salesdept,cn=OracleContext,dc=com/salesdb
+   * </pre>
+   * This is unusual, but it is what Oracle JDBC expects to see in the path
+   * element of a
+   * <a href="https://docs.oracle.com/en/database/oracle/oracle-database/21/jjdbc/data-sources-and-URLs.html#GUID-F1841136-BE7C-47D4-8AEE-E9E78CA1213D">
+   * multi-address LDAP URL.
+   * </a>
+   * </p>
    * @param options R2DBC options. Not null.
    * @return An Oracle JDBC URL composed from R2DBC options
    * @throws IllegalArgumentException If the {@code oracleNetDescriptor}
@@ -423,22 +385,79 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
 
     if (descriptor != null) {
       validateDescriptorOptions(options);
-      return "jdbc:oracle:thin:@" + descriptor.toString();
+      return "jdbc:oracle:thin:@" + descriptor;
     }
-    else {
-      Object host = options.getRequiredValue(HOST);
-      Integer port = parseOptionValue(
-        PORT, options, Integer.class, Integer::valueOf);
-      Object serviceName = options.getValue(DATABASE);
-      Boolean isTcps = parseOptionValue(
-        SSL, options, Boolean.class, Boolean::valueOf);
 
-      return String.format("jdbc:oracle:thin:@%s%s%s%s",
-        Boolean.TRUE.equals(isTcps) ? "tcps:" : "",
-        host,
-        port != null ? (":" + port) : "",
-        serviceName != null ? ("/" + serviceName) : "");
-    }
+    String protocol = composeJdbcProtocol(options);
+
+    Object host = options.getRequiredValue(HOST);
+
+    Integer port =
+      parseOptionValue(PORT, options, Integer.class, Integer::valueOf);
+
+    Object serviceName = options.getValue(DATABASE);
+
+    Object dnMatch =
+      options.getValue(OracleR2dbcOptions.TLS_SERVER_DN_MATCH);
+
+    return String.format("jdbc:oracle:thin:@%s%s%s%s?%s=%s",
+      protocol,
+      host,
+      port != null ? (":" + port) : "",
+      serviceName != null ? ("/" + serviceName) : "",
+      // Workaround for Oracle JDBC bug #33150409. DN matching is enabled
+      // unless the property is set as a query parameter.
+      OracleR2dbcOptions.TLS_SERVER_DN_MATCH.name(),
+      dnMatch == null ? "false" : dnMatch);
+  }
+
+  /**
+   * <p>
+   * Composes the protocol section of an Oracle JDBC URL. This is an optional
+   * section that may appear after the '@' symbol. For instance, the follow URL
+   * would specify the "tcps" protocol:
+   * </p><p>
+   * <pre>
+   *   jdbc:oracle:thin:@tcps://...
+   * </pre>
+   * </p><p>
+   * If {@link ConnectionFactoryOptions#SSL} is set, then "tcps://" is returned.
+   * The {@code SSL} option is interpreted as a strict directive to use TLS, and
+   * so it takes precedence over any value that may be specified with the
+   * {@link ConnectionFactoryOptions#PROTOCOL} option.
+   * </p><p>
+   * Otherwise, if the {@code SSL} option is not set, then the protocol section
+   * is composed with any value set to the
+   * {@link ConnectionFactoryOptions#PROTOCOL} option. For
+   * instance, if the {@code PROTOCOL} option is set to "ldap" then the URL
+   * is composed as: {@code jdbc:oracle:thin:@ldap://...}.
+   * </p><p>
+   * If the {@code PROTOCOL} option is set to an empty string, this is
+   * considered equivalent to not setting the option at all. The R2DBC Pool
+   * library is known to set an empty string as the protocol .
+   * </p>
+   * @param options Options that may or may not specify a protocol. Not null.
+   * @return The specified protocol, or an empty string if none is specified.
+   */
+  private static String composeJdbcProtocol(ConnectionFactoryOptions options) {
+
+    Boolean isSSL =
+      parseOptionValue(SSL, options, Boolean.class, Boolean::valueOf);
+
+    if (Boolean.TRUE.equals(isSSL))
+      return "tcps://";
+
+    Object protocolObject = options.getValue(PROTOCOL);
+
+    if (protocolObject == null)
+      return "";
+
+    String protocol = protocolObject.toString();
+
+    if (protocol.isEmpty())
+      return "";
+
+    return protocol + "://";
   }
 
   /**
@@ -452,8 +471,7 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
   private static void validateDescriptorOptions(
     ConnectionFactoryOptions options) {
     Option<?>[] conflictingOptions =
-      Set.of(HOST, PORT, DATABASE, SSL)
-        .stream()
+      Stream.of(HOST, PORT, DATABASE, SSL)
         .filter(options::hasOption)
         .filter(option ->
           // Ignore options having a value that can be represented as a
@@ -526,7 +544,13 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
     }
 
     // Apply any JDBC connection property options
-    for (Option<CharSequence> option : JDBC_CONNECTION_PROPERTY_OPTIONS) {
+    for (Option<?> option : OracleR2dbcOptions.options()) {
+
+      // Skip options in the oracle.r2dbc namespace. These are not JDBC
+      // connection properties
+      if (option.name().startsWith("oracle.r2dbc."))
+        continue;
+
       // Using Object as the value type allows options to be set as types like
       // Boolean or Integer. These types make sense for numeric or boolean
       // connection property values, such as statement cache size, or enable x.
@@ -603,18 +627,17 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
 
     // Have the Oracle JDBC Driver implement behavior that the JDBC
     // Specification defines as correct. The javadoc for this property lists
-    // all of it's effects. One effect is to have ResultSetMetaData describe
+    // its effects. One effect is to have ResultSetMetaData describe
     // FLOAT columns as the FLOAT type, rather than the NUMBER type. This
     // effect allows the Oracle R2DBC Driver obtain correct metadata for
-    // FLOAT type columns. The property is deprecated, but the deprecation note
-    // explains that setting this to "false" is deprecated, and that it
-    // should be set to true; If not set, the 21c driver uses a default value
-    // of false.
-    @SuppressWarnings("deprecation")
-    String enableJdbcSpecCompliance =
-      OracleConnection.CONNECTION_PROPERTY_J2EE13_COMPLIANT;
+    // FLOAT type columns.
+    // The OracleConnection.CONNECTION_PROPERTY_J2EE13_COMPLIANT field is
+    // deprecated, so the String literal value of this field is used instead,
+    // just in case the field were to be removed in a future release of Oracle
+    // JDBC.
     runJdbc(() ->
-      oracleDataSource.setConnectionProperty(enableJdbcSpecCompliance, "true"));
+      oracleDataSource.setConnectionProperty(
+        "oracle.jdbc.J2EE13Compliant", "true"));
 
     // Cache PreparedStatements by default. The default value of the
     // OPEN_CURSORS parameter in the 21c and 19c databases is 50:
@@ -625,19 +648,27 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
     setPropertyIfAbsent(oracleDataSource,
       OracleConnection.CONNECTION_PROPERTY_IMPLICIT_STATEMENT_CACHE_SIZE, "25");
 
-    // Prefetch LOB values by default. The database's maximum supported
-    // prefetch size, 1GB, is configured by default. This is done so that
-    // Row.get(...) can map LOB values into ByteBuffer/String without a
-    // blocking database call. If the entire value is prefetched, then JDBC
-    // won't need to fetch the remainder from the database when the entire is
-    // value requested as a ByteBuffer or String.
+    // Prefetch LOB values by default. This allows Row.get(...) to map most LOB
+    // values into ByteBuffer/String without a blocking database call to fetch
+    // the remaining bytes. 1GB is configured by default, as this is close to
+    // the maximum allowed by the Autonomous Database service.
     setPropertyIfAbsent(oracleDataSource,
       OracleConnection.CONNECTION_PROPERTY_DEFAULT_LOB_PREFETCH_SIZE,
-      "1048576");
+      "1000000000");
 
     // TODO: Disable the result set cache? This is needed to support the
     //  SERIALIZABLE isolation level, which requires result set caching to be
     //  disabled.
+
+    // Disable "zero copy IO" by default. This is important when using JSON or
+    // VECTOR binds, which are usually sent with zero copy IO. The 23.4 database
+    // does not fully support zero copy IO with pipelined calls. In particular,
+    // it won't respond if a SQL operation results in an error, and zero copy IO
+    // was used to send bind values. This will likely be resolved in a later
+    // release; Keep an eye on bug #36485816 to see when it's fixed.
+    setPropertyIfAbsent(oracleDataSource,
+      OracleConnection.CONNECTION_PROPERTY_THIN_NET_USE_ZERO_COPY_IO,
+      "false");
   }
 
   /**
@@ -892,28 +923,19 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
    * contents are always copied into a new byte array. In a later release,
    * avoiding the copy using {@link ByteBuffer#array()} can be worth
    * considering.
-   *
-   * @implNote The 21c {@code OracleBlob} subscriber violates Rule 2.7 of the
-   * Reactive Streams Specification, which prohibits concurrent calls to
-   * {@link Subscription#request(long)}. This can cause undefined behavior by
-   * the {@code contentPublisher}. To work around this bug, this method
-   * proxies the {@link Subscription} between the {@code contentPublisher}
-   * and the {@code OracleBlob} subscriber. The proxy ensures that
-   * {@code request} signals are delivered serially.
    */
   @Override
   public Publisher<Void> publishBlobWrite(
     Publisher<ByteBuffer> contentPublisher, Blob blob) {
     OracleBlob oracleBlob = castAsType(blob, OracleBlob.class);
 
-    // TODO: Move subscriberOracleCall into adaptFlowPublisher, so that it
+    // TODO: Move subscriberOracle Call into adaptFlowPublisher, so that it
     //  avoids lock contention
-    // This processor emits a terminal signal when all blob writing database
-    // calls have completed
-    DirectProcessor<Long> writeOutcomeProcessor = DirectProcessor.create();
+    // This subscriber receives a terminal signal after JDBC completes the
+    // LOB write.
+    CompletionSubscriber<Long> outcomeSubscriber = new CompletionSubscriber<>();
     Flow.Subscriber<byte[]> blobSubscriber = fromJdbc(() ->
-      oracleBlob.subscriberOracle(1L,
-        toFlowSubscriber(writeOutcomeProcessor)));
+      oracleBlob.subscriberOracle(1L, outcomeSubscriber));
 
     // TODO: Acquire async lock before invoking onNext, release when
     //  writeOutcomeProcessor gets onNext with sum equal to sum of buffer
@@ -935,9 +957,10 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
           slice.get(byteArray);
           return byteArray;
         })
-        .subscribe(new SerializedLobSubscriber<>(blobSubscriber));
+        .subscribe(toSubscriber(blobSubscriber));
 
-      return toFlowPublisher(writeOutcomeProcessor.then());
+
+      return toFlowPublisher(outcomeSubscriber.publish());
     });
   }
 
@@ -949,33 +972,24 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
    * {@link OracleClob#subscriberOracle(long, Flow.Subscriber)} adapted to
    * conform with the R2DBC standards.
    * </p>
-   *
-   * @implNote The 21c {@code OracleClob} subscriber violates Rule 2.7 of the
-   * Reactive Streams Specification, which prohibits concurrent calls to
-   * {@link Subscription#request(long)}. This can cause undefined behavior by
-   * the {@code contentPublisher}. To work around this bug, this method
-   * proxies the {@link Subscription} between the {@code contentPublisher}
-   * and the {@code OracleClob} subscriber. The proxy ensures that
-   * {@code request} signals are delivered serially.
    */
   @Override
   public Publisher<Void> publishClobWrite(
     Publisher<? extends CharSequence> contentPublisher, Clob clob) {
     OracleClob oracleClob = castAsType(clob, OracleClob.class);
 
-    // This processor emits a terminal signal when all clob writing database
-    // calls have completed
-    DirectProcessor<Long> writeOutcomeProcessor = DirectProcessor.create();
+    // This subscriber receives a terminal signal after JDBC completes the
+    // LOB write.
+    CompletionSubscriber<Long> outcomeSubscriber = new CompletionSubscriber<>();
     Flow.Subscriber<String> clobSubscriber = fromJdbc(() ->
-      oracleClob.subscriberOracle(1L,
-        toFlowSubscriber(writeOutcomeProcessor)));
+      oracleClob.subscriberOracle(1L, outcomeSubscriber));
 
     return adaptFlowPublisher(() -> {
       Flux.from(contentPublisher)
         .map(CharSequence::toString)
-        .subscribe(new SerializedLobSubscriber<>(clobSubscriber));
+        .subscribe(toSubscriber(clobSubscriber));
 
-      return toFlowPublisher(writeOutcomeProcessor.then());
+      return toFlowPublisher(outcomeSubscriber.publish());
     });
   }
 
@@ -1251,134 +1265,59 @@ final class OracleReactiveJdbcAdapter implements ReactiveJdbcAdapter {
   }
 
   /**
-   * <p>
-   * A {@code Subscriber} that serializes {@code Subscription} method calls
-   * made by {@link OracleBlob} or {@link OracleClob} subscribers. The purpose
-   * of this class is to work around Oracle JDBC Bug #32097526, in which the
-   * Large Object (LOB) subscribers violate Rule 2.7 of the Reactive Streams
-   * 1.0.3 Specification by invoking subscription methods concurrently. This
-   * violation can lead to unspecified behavior from the upstream LOB content
-   * {@code Publisher}.
-   * </p><p>
-   * This class serves as an intermediary between a LOB content publisher
-   * upstream, and the LOB subscriber downstream. It presents itself as a
-   * subscription to the LOB subscriber so that it can regulate it's
-   * subscription method calls. Each subscription call is regulated by
-   * acquiring a mutually exclusive lock before the call is forwarded to the
-   * content publisher's subscription.
-   * </p>
-   *
-   * @implNote This class is an {@code org.reactivestreams.Subscriber} and a
-   * {@code java.util.concurrent.Flow.Subscription}. These APIs were chosen to
-   * interface with R2DBC Blob/Clob publishers upstream, and with Reactive
-   * Extensions downstream.
-   * @param <T> The type of item subscribed to
+   * A subscriber that relays {@code onComplete} or {@code onError} signals
+   * from an upstream publisher to downstream subscribers. This subscriber
+   * ignores {@code onNext} signals from an upstream publisher. This subscriber
+   * signals unbounded demand to an upstream publisher.
+   * @param <T> Type of values emitted from an upstream publisher.
    */
-  private static class SerializedLobSubscriber<T>
-    implements org.reactivestreams.Subscriber<T>, Flow.Subscription {
+  private static final class CompletionSubscriber<T>
+    implements Flow.Subscriber<T> {
 
-    /** The downstream OracleBlob/OracleClob subscriber */
-    final Flow.Subscriber<T> lobSubscriber;
-
-    /** Guards access to the upstream content publisher's subscription */
-    final ReentrantLock signalLock = new ReentrantLock();
-
-    /** The upstream content publisher's subscription */
-    Subscription contentSubscription;
+    /** Future completed by {@code onSubscribe} */
+    private final CompletableFuture<Flow.Subscription> subscriptionFuture =
+      new CompletableFuture<>();
 
     /**
-     * Constructs a new subscriber that regulates subscription calls from a
-     * {@code lobSubscriber}. The {@code onSubscribe} method of the {@code
-     * lobSubscriber} is invoked when the {@code onSubscribe} method of the
-     * constructed subscriber is invoked.
+     * Future completed normally by {@code onComplete}, or exceptionally by
+     * {@code onError}
      */
-    SerializedLobSubscriber(Flow.Subscriber<T> lobSubscriber) {
-      this.lobSubscriber = lobSubscriber;
-    }
+    private final CompletableFuture<Void> resultFuture =
+      new CompletableFuture<>();
 
-    /**
-     * {@inheritDoc}
-     * <p>
-     * Retains the {@code subscription} and presents itself as a subscription
-     * to the LOB subscriber. Subscription calls from the LOB subscriber are
-     * then serially forwarded to the {@code subscription}.
-     * </p>
-     */
     @Override
-    public void onSubscribe(Subscription subscription) {
-      contentSubscription = subscription;
-      lobSubscriber.onSubscribe(this);
+    public void onSubscribe(Flow.Subscription subscription) {
+      subscriptionFuture.complete(Objects.requireNonNull(subscription));
+      subscription.request(Long.MAX_VALUE);
     }
 
-    /**
-     * {@inheritDoc}
-     * <p>
-     * Regulates a request call from the {@code lobSubscriber} by first
-     * blocking until any active {@code request} or {@code cancel} call has
-     * completed, and then forwarding the request to the content publisher.
-     * </p>
-     */
-    @Override
-    public void request(long n) {
-      signalLock.lock();
-      try {
-        contentSubscription.request(n);
-      }
-      finally {
-        signalLock.unlock();
-      }
-    }
-
-    /**
-     * {@inheritDoc}
-     * <p>
-     * Regulates a cancel call from the {@code lobSubscriber} by first
-     * blocking until any active {@code request} or {@code cancel} call has
-     * completed, and then forwarding the cancel to the content publisher.
-     * </p>
-     */
-    @Override
-    public void cancel() {
-      signalLock.lock();
-      try {
-        contentSubscription.cancel();
-      }
-      finally {
-        signalLock.unlock();
-      }
-    }
-
-    /**
-     * {@inheritDoc}
-     * <p>
-     * Forwards the signal to the LOB subscriber without any regulation.
-     * </p>
-     */
     @Override
     public void onNext(T item) {
-      lobSubscriber.onNext(item);
     }
 
-    /**
-     * {@inheritDoc}
-     * <p>
-     * Forwards the signal to the LOB subscriber without any regulation.
-     * </p>
-     */
     @Override
     public void onError(Throwable throwable) {
-      lobSubscriber.onError(throwable);
+      resultFuture.completeExceptionally(Objects.requireNonNull(throwable));
+    }
+
+    @Override
+    public void onComplete() {
+      resultFuture.complete(null);
     }
 
     /**
-     * {@inheritDoc}
-     * <p>
-     * Forwards the signal to the LOB subscriber without any regulation.
-     * </p>
+     * Returns a publisher that emits the same {@code onComplete} or
+     * {@code onError} signal emitted to this subscriber. Cancelling a
+     * subscription to the returned publisher cancels the subscription of this
+     * subscriber.
+     * @return A publisher that emits the terminal signal emitted to this
+     * subscriber.
      */
-    @Override
-    public void onComplete() {
-      lobSubscriber.onComplete();
+    Publisher<Void> publish() {
+      return Mono.fromCompletionStage(resultFuture)
+        .doOnCancel(() ->
+          subscriptionFuture.thenAccept(Flow.Subscription::cancel));
     }
   }
+
 }

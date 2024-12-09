@@ -23,17 +23,22 @@ package oracle.r2dbc.impl;
 
 import io.r2dbc.spi.Connection;
 import io.r2dbc.spi.ConnectionFactories;
+import io.r2dbc.spi.ConnectionFactory;
 import io.r2dbc.spi.ConnectionFactoryOptions;
 import io.r2dbc.spi.Option;
 import io.r2dbc.spi.R2dbcTimeoutException;
 import io.r2dbc.spi.Result;
+import io.r2dbc.spi.Statement;
 import oracle.jdbc.OracleConnection;
 import oracle.jdbc.datasource.OracleDataSource;
 import oracle.r2dbc.OracleR2dbcOptions;
+import oracle.r2dbc.test.DatabaseConfig;
+import oracle.r2dbc.util.TestContextFactory;
 import org.junit.jupiter.api.Test;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import javax.sql.DataSource;
 import java.io.IOException;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -42,8 +47,14 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.sql.SQLException;
 import java.time.Duration;
+import java.time.ZonedDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -53,6 +64,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static io.r2dbc.spi.ConnectionFactoryOptions.CONNECT_TIMEOUT;
@@ -61,12 +73,16 @@ import static io.r2dbc.spi.ConnectionFactoryOptions.DRIVER;
 import static io.r2dbc.spi.ConnectionFactoryOptions.HOST;
 import static io.r2dbc.spi.ConnectionFactoryOptions.PASSWORD;
 import static io.r2dbc.spi.ConnectionFactoryOptions.PORT;
+import static io.r2dbc.spi.ConnectionFactoryOptions.PROTOCOL;
 import static io.r2dbc.spi.ConnectionFactoryOptions.STATEMENT_TIMEOUT;
 import static io.r2dbc.spi.ConnectionFactoryOptions.USER;
+import static java.lang.String.format;
 import static oracle.r2dbc.test.DatabaseConfig.connectTimeout;
+import static oracle.r2dbc.test.DatabaseConfig.connectionFactoryOptions;
 import static oracle.r2dbc.test.DatabaseConfig.host;
 import static oracle.r2dbc.test.DatabaseConfig.password;
 import static oracle.r2dbc.test.DatabaseConfig.port;
+import static oracle.r2dbc.test.DatabaseConfig.protocol;
 import static oracle.r2dbc.test.DatabaseConfig.serviceName;
 import static oracle.r2dbc.test.DatabaseConfig.sharedConnection;
 import static oracle.r2dbc.test.DatabaseConfig.sqlTimeout;
@@ -75,6 +91,7 @@ import static oracle.r2dbc.util.Awaits.awaitError;
 import static oracle.r2dbc.util.Awaits.awaitExecution;
 import static oracle.r2dbc.util.Awaits.awaitNone;
 import static oracle.r2dbc.util.Awaits.awaitOne;
+import static oracle.r2dbc.util.Awaits.awaitQuery;
 import static oracle.r2dbc.util.Awaits.awaitUpdate;
 import static oracle.r2dbc.util.Awaits.tryAwaitExecution;
 import static oracle.r2dbc.util.Awaits.tryAwaitNone;
@@ -82,11 +99,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Verifies that
  * {@link OracleReadableMetadataImpl} implements behavior that is specified in
- * it's class and method level javadocs.
+ * its class and method level javadocs.
  */
 public class OracleReactiveJdbcAdapterTest {
 
@@ -102,16 +120,7 @@ public class OracleReactiveJdbcAdapterTest {
     // properties. The defaultProperties variable contains properties that
     // are set to default values by OracleReactiveJdbcAdapter and the Oracle
     // JDBC Driver
-    Properties defaultProperties = new Properties();
-    defaultProperties.setProperty(
-      OracleConnection.CONNECTION_PROPERTY_J2EE13_COMPLIANT, "true");
-    defaultProperties.setProperty(
-      OracleConnection.CONNECTION_PROPERTY_ENABLE_AC_SUPPORT, "false");
-    defaultProperties.setProperty(
-      OracleConnection.CONNECTION_PROPERTY_IMPLICIT_STATEMENT_CACHE_SIZE, "25");
-    defaultProperties.setProperty(
-      OracleConnection.CONNECTION_PROPERTY_DEFAULT_LOB_PREFETCH_SIZE,
-      "1048576");
+    Properties defaultProperties = getJdbcDefaultProperties();
 
     // Expect only default connection properties when no extended
     // options are supplied
@@ -210,10 +219,7 @@ public class OracleReactiveJdbcAdapterTest {
   public void testTnsAdmin() throws IOException {
 
     // Create an Oracle Net Descriptor
-    String descriptor = String.format(
-      "(DESCRIPTION=(ADDRESS=(HOST=%s)(PORT=%d)(PROTOCOL=tcp))" +
-        "(CONNECT_DATA=(SERVICE_NAME=%s)))",
-      host(), port(), serviceName());
+    String descriptor = createDescriptor();
 
     // Create a tnsnames.ora file with an alias for the descriptor
     Files.writeString(Path.of("tnsnames.ora"),
@@ -227,13 +233,13 @@ public class OracleReactiveJdbcAdapterTest {
     try {
       // Expect to connect with the descriptor in the R2DBC URL
       awaitNone(awaitOne(
-        ConnectionFactories.get(String.format(
+        ConnectionFactories.get(format(
           "r2dbc:oracle://%s:%s@?oracle.r2dbc.descriptor=%s",
           user(), password(), descriptor))
           .create())
         .close());
       awaitNone(awaitOne(
-        ConnectionFactories.get(ConnectionFactoryOptions.parse(String.format(
+        ConnectionFactories.get(ConnectionFactoryOptions.parse(format(
           "r2dbc:oracle://@?oracle.r2dbc.descriptor=%s", descriptor))
           .mutate()
           .option(USER, user())
@@ -245,14 +251,14 @@ public class OracleReactiveJdbcAdapterTest {
       // Expect to connect with the tnsnames.ora file, when a URL specifies
       // the file path and an alias
       awaitNone(awaitOne(
-        ConnectionFactories.get(String.format(
+        ConnectionFactories.get(format(
           "r2dbc:oracle://%s:%s@?oracle.r2dbc.descriptor=%s&TNS_ADMIN=%s",
           user(), password(), "test_alias", userDir))
           .create())
           .close());
       awaitNone(awaitOne(
         ConnectionFactories.get(ConnectionFactoryOptions.parse(
-          String.format(
+          format(
             "r2dbc:oracle://@?oracle.r2dbc.descriptor=%s&TNS_ADMIN=%s",
             "test_alias", userDir))
           .mutate()
@@ -288,14 +294,14 @@ public class OracleReactiveJdbcAdapterTest {
 
       // Create an ojdbc.properties file containing the user name
       Files.writeString(Path.of("ojdbc.properties"),
-        String.format("user=%s", user()),
+        format("user=%s", user()),
         StandardOpenOption.CREATE_NEW);
       try {
         // Expect to connect with the tnsnames.ora and ojdbc.properties files,
         // when a URL specifies their path and an alias, the properties file
         // specifies a user, and a standard option specifies the password.
         awaitNone(awaitOne(
-          ConnectionFactories.get(ConnectionFactoryOptions.parse(String.format(
+          ConnectionFactories.get(ConnectionFactoryOptions.parse(format(
             "r2dbc:oracle://?oracle.r2dbc.descriptor=%s&TNS_ADMIN=%s",
             "test_alias", userDir))
             .mutate()
@@ -362,20 +368,22 @@ public class OracleReactiveJdbcAdapterTest {
    */
   @Test
   public void testStatementTimeout() {
+    // Assume that oracle.jdbc.disablePipeline is only set to false when
+    // experimenting with pipelining on Mac OS. In this scenario, statement
+    // cancellation is known to not work.
+    String disabledProperty = System.getProperty("oracle.jdbc.disablePipeline");
+    assumeTrue(
+      disabledProperty == null || disabledProperty.equalsIgnoreCase("true"),
+      "oracle.jdbc.disablePipeline is set, and the value is not \"true\"");
+
     Connection connection0 =
-      Mono.from(ConnectionFactories.get(ConnectionFactoryOptions
-        .builder()
-        .option(DRIVER, "oracle")
-        .option(HOST, host())
-        .option(PORT, port())
-        .option(DATABASE, serviceName())
-        .option(USER, user())
-        .option(PASSWORD, password())
+      Mono.from(ConnectionFactories.get(connectionFactoryOptions()
+        .mutate()
         .option(STATEMENT_TIMEOUT, Duration.ofSeconds(2))
-        // Disable OOB to support testing with an 18.x database
+        // Disable OOB to support when testing with an 18.x database
         .option(Option.valueOf(
           OracleConnection.CONNECTION_PROPERTY_THIN_NET_DISABLE_OUT_OF_BAND_BREAK),
-          "true")
+          String.valueOf(DatabaseConfig.databaseVersion() <= 18))
         .build())
         .create())
         .block(connectTimeout());
@@ -440,14 +448,9 @@ public class OracleReactiveJdbcAdapterTest {
 
     // Create a connection that is configured to use the custom executor
     Connection connection = awaitOne(ConnectionFactories.get(
-      ConnectionFactoryOptions.builder()
+      connectionFactoryOptions()
+        .mutate()
         .option(OracleR2dbcOptions.EXECUTOR, testExecutor)
-        .option(DRIVER, "oracle")
-        .option(HOST, host())
-        .option(PORT, port())
-        .option(DATABASE, serviceName())
-        .option(USER, user())
-        .option(PASSWORD, password())
         .build())
         .create());
 
@@ -467,6 +470,340 @@ public class OracleReactiveJdbcAdapterTest {
     finally {
       tryAwaitNone(connection.close());
     }
+  }
+
+  /**
+   * Verifies the
+   * {@link OracleR2dbcOptions#VSESSION_OSUSER},
+   * {@link OracleR2dbcOptions#VSESSION_TERMINAL},
+   * {@link OracleR2dbcOptions#VSESSION_PROCESS},
+   * {@link OracleR2dbcOptions#VSESSION_PROGRAM}, and
+   * {@link OracleR2dbcOptions#VSESSION_MACHINE} options.
+   */
+  @Test
+  public void testVSessionOptions() {
+    String osuser = "test-osuser";
+    String terminal = "test-terminal";
+    String process = "test-process";
+    String program = "test-program";
+    String machine = "test-machine";
+
+    // Verify configuration with URL parameters
+    Connection connection = awaitOne(ConnectionFactories.get(
+      ConnectionFactoryOptions.parse(
+        format("r2dbc:oracle:%s//%s:%d/%s" +
+          "?v$session.osuser=%s" +
+          "&v$session.terminal=%s" +
+          "&v$session.process=%s" +
+          "&v$session.program=%s" +
+          "&v$session.machine=%s",
+          Optional.ofNullable(protocol())
+            .map(protocol -> protocol + ":")
+            .orElse(""),
+          host(), port(), serviceName(),
+          osuser, terminal, process, program, machine))
+      .mutate()
+      .option(USER, user())
+      .option(PASSWORD, password())
+      .build())
+      .create());
+    try {
+      Result result = awaitOne(connection.createStatement(
+        "SELECT count(*)" +
+          " FROM v$session" +
+          " WHERE osuser=?" +
+          " AND terminal=?" +
+          " AND process=?" +
+          " AND program=?" +
+          " AND machine=?")
+        .bind(0, osuser)
+        .bind(1, terminal)
+        .bind(2, process)
+        .bind(3, program)
+        .bind(4, machine)
+        .execute());
+
+      assertEquals(
+        Integer.valueOf(1),
+        awaitOne(result.map(row -> row.get(0, Integer.class))));
+    }
+    finally {
+      tryAwaitNone(connection.close());
+    }
+  }
+  /**
+   * Verifies the use of the LDAP protocol in an r2dbc:oracle URL.
+   */
+  @Test
+  public void testLdapUrl() throws Exception {
+
+    // Configure Oracle R2DBC with an R2DBC URL having the LDAP protocol and the
+    // given path.
+    String ldapPath = "sales,cn=OracleContext,dc=com";
+    ConnectionFactory ldapConnectionFactory = ConnectionFactories.get(
+      ConnectionFactoryOptions.parse(format(
+          "r2dbc:oracle:ldap://ldap.example.com:9999/%s", ldapPath))
+        .mutate()
+        .option(ConnectionFactoryOptions.USER, DatabaseConfig.user())
+        .option(ConnectionFactoryOptions.PASSWORD, DatabaseConfig.password())
+        .build());
+
+    // Set up the mock LDAP context factory. See JavaDoc of TestContextFactory
+    // for details about this.
+    TestContextFactory.bind(ldapPath, createDescriptor());
+
+    // Now verify that the LDAP URL is resolved to the descriptor
+    Connection ldapConnection = awaitOne(ldapConnectionFactory.create());
+    try {
+      assertEquals(
+        "Hello, LDAP",
+        awaitOne(
+          awaitOne(ldapConnection.createStatement(
+              "SELECT 'Hello, LDAP' FROM sys.dual")
+            .execute())
+            .map(row -> row.get(0))));
+    }
+    finally {
+      tryAwaitNone(ldapConnection.close());
+    }
+  }
+
+  /**
+   * Verifies the use of the LDAP protocol in an r2dbc:oracle URL having
+   * multiple LDAP endpoints
+   */
+  @Test
+  public void testMultiLdapUrl() throws Exception {
+
+    // Configure Oracle R2DBC with an R2DBC URL having the LDAP protocol and
+    // multiple LDAP endpoints. Only the last endpoint will contain the given
+    // path, and so the previous endpoints are invalid.
+    String ldapPath = "cn=salesdept,cn=OracleContext,dc=com/salesdb";
+    ConnectionFactory ldapConnectionFactory = ConnectionFactories.get(
+      ConnectionFactoryOptions.parse(format(
+        "r2dbc:oracle:" +
+          "ldap://ldap1.example.com:7777/cn=salesdept0,cn=OracleContext,dc=com/salesdb" +
+          "%%20ldap://ldap1.example.com:7777/cn=salesdept1,cn=OracleContext,dc=com/salesdb" +
+          "%%20ldap://ldap3.example.com:7777/%s", ldapPath))
+        .mutate()
+        .option(ConnectionFactoryOptions.USER, DatabaseConfig.user())
+        .option(ConnectionFactoryOptions.PASSWORD, DatabaseConfig.password())
+        .build());
+
+    // Set up the mock LDAP context factory. A descriptor is bound to the last
+    // endpoint only. See JavaDoc of TestContextFactory for details about this.
+    TestContextFactory.bind("salesdb", createDescriptor());
+
+    // Now verify that the LDAP URL is resolved to the descriptor
+    Connection ldapConnection = awaitOne(ldapConnectionFactory.create());
+    try {
+      assertEquals(
+        "Hello, LDAP",
+        awaitOne(
+          awaitOne(ldapConnection.createStatement(
+            "SELECT 'Hello, LDAP' FROM sys.dual")
+            .execute())
+            .map(row -> row.get(0))));
+    }
+    finally {
+      tryAwaitNone(ldapConnection.close());
+    }
+  }
+
+  /**
+   * Verifies the {@link OracleR2dbcOptions#TIMEZONE_AS_REGION} option
+   */
+  @Test
+  public void testTimezoneAsRegion() {
+    // Set the timezone to that of Warsaw. When JDBC opens a connection, it will
+    // read the Warsaw timezone from TimeZone.getDefault().
+    TimeZone warsawTimeZone = TimeZone.getTimeZone("Europe/Warsaw");
+    TimeZone timeZoneRestored = TimeZone.getDefault();
+    TimeZone.setDefault(warsawTimeZone);
+    try {
+
+      // Configure the JDBC connection property with a URL parameter. This has
+      // JDBC express the session timezone as an offset of UTC (+02:00), rather
+      // than a name (Europe/Warsaw).
+      Connection connection = awaitOne(ConnectionFactories.get(
+        ConnectionFactoryOptions.parse(format(
+          "r2dbc:oracle%s://%s:%d/%s?oracle.jdbc.timezoneAsRegion=false",
+          protocol() == null ? "" : ":" + protocol(),
+          host(), port(), serviceName()))
+          .mutate()
+          .option(USER, user())
+          .option(PASSWORD, password())
+          .build())
+        .create());
+      try {
+
+        // Query the session timezone, and expect it to be expressed as an
+        // offset, rather than a name.
+        assertEquals(
+          ZonedDateTime.now(warsawTimeZone.toZoneId())
+            .getOffset()
+            .toString(),
+          awaitOne(awaitOne(connection.createStatement(
+            "SELECT sessionTimeZone FROM sys.dual")
+            .execute())
+            .map(row ->
+              row.get(0, String.class))));
+      }
+      finally {
+        tryAwaitNone(connection.close());
+      }
+    }
+    finally {
+      TimeZone.setDefault(timeZoneRestored);
+    }
+  }
+
+
+  /**
+   * Verifies behavior when {@link ConnectionFactoryOptions#PROTOCOL} is set
+   * to an empty string. In this case, the driver is expected to behave as if
+   * no protocol were specified.
+   */
+  @Test
+  public void testEmptyProtocol() {
+    assumeTrue(
+      DatabaseConfig.protocol() == null,
+      "Test requires no PROTOCOL in config.properties");
+
+    ConnectionFactoryOptions.Builder optionsBuilder =
+      ConnectionFactoryOptions.builder()
+        .option(PROTOCOL, "")
+        .option(DRIVER, "oracle")
+        .option(HOST, DatabaseConfig.host())
+        .option(PORT, DatabaseConfig.port())
+        .option(DATABASE, DatabaseConfig.serviceName())
+        .option(USER, DatabaseConfig.user())
+        .option(PASSWORD, DatabaseConfig.password());
+
+    Duration timeout = DatabaseConfig.connectTimeout();
+    if (timeout != null)
+      optionsBuilder.option(CONNECT_TIMEOUT, timeout);
+
+    ConnectionFactoryOptions options = optionsBuilder.build();
+
+    Connection connection = awaitOne(ConnectionFactories.get(options).create());
+    try {
+      Statement statement =
+        connection.createStatement("SELECT 1 FROM sys.dual");
+
+      awaitQuery(List.of(1), row -> row.get(0, Integer.class), statement);
+    }
+    finally {
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  @Test
+  public void testJdbcPropertyOptions() throws SQLException {
+
+    // Create a map where every Option of OracleR2dbcOptions is assigned to a
+    // value. The values are not necessarily valid, or even of the right class
+    // (every option is cast to Option<String>). That's OK because this test
+    // just wants to make sure the values are transferred to OracleDataSource,
+    // and it won't actually attempt to create a connection with these values.
+    Map<Option<String>, String> optionValues =
+      OracleR2dbcOptions.options()
+        .stream()
+        .map(option -> {
+          @SuppressWarnings("unchecked")
+          Option<String> stringOption = (Option<String>)option;
+          return stringOption;
+        })
+        .collect(Collectors.toMap(
+          Function.identity(),
+          option -> "VALUE OF " + option.name()
+        ));
+
+    ConnectionFactoryOptions.Builder optionsBuilder =
+      ConnectionFactoryOptions.builder();
+    optionValues.forEach(optionsBuilder::option);
+
+    DataSource dataSource =
+      OracleReactiveJdbcAdapter.getInstance()
+        .createDataSource(optionsBuilder.build());
+    assumeTrue(dataSource.isWrapperFor(OracleDataSource.class));
+
+    Properties actualProperties =
+      dataSource.unwrap(OracleDataSource.class)
+        .getConnectionProperties();
+
+    Properties expectedProperties = getJdbcDefaultProperties();
+    optionValues.forEach((option, value) ->
+      expectedProperties.setProperty(option.name(), value));
+
+    expectedProperties.entrySet()
+        .removeAll(actualProperties.entrySet());
+
+    // Don't expect OracleDataSource.getConnectionProperties() to have entries
+    // for options that Oracle R2DBC doesn't set as connection properties.
+    expectedProperties.entrySet()
+        .removeIf(entry ->
+          entry.getKey().toString().startsWith("oracle.r2dbc."));
+
+    // Don't expect OracleDataSource.getConnectionProperties() to have entries
+    // for options of security sensitive values.
+    expectedProperties.entrySet()
+      .removeIf(entry ->
+        entry.getKey().toString().toLowerCase().contains("password"));
+
+    assertTrue(
+      expectedProperties.isEmpty(),
+      "One or more properties were not set: " + expectedProperties);
+  }
+
+  /**
+   * Returns the connection properties that will be set by default when an
+   * {@link OracleDataSource} is created. Tests which verify the setting of
+   * properties can assume these default properties will be set as well.
+   *
+   * @return Properties that OracleDataSource sets by default.
+   */
+  private static Properties getJdbcDefaultProperties() throws SQLException {
+
+    // Start with any properties that JDBC will set by default. For example, the
+    // 21 driver would set CONNECTION_PROPERTY_ENABLE_AC_SUPPORT="false" by
+    // default.
+    Properties defaultProperties =
+      new oracle.jdbc.datasource.impl.OracleDataSource()
+        .getConnectionProperties();
+
+    if (defaultProperties == null)
+      defaultProperties = new Properties();
+
+    // Set the properties that Oracle R2DBC will set by default
+    // Not referencing the deprecated
+    // OracleConnection.CONNECTION_PROPERTY_J2EE13_COMPLIANT field, just in case
+    // it  gets removed in a future release of Oracle JDBC.
+    defaultProperties.setProperty("oracle.jdbc.J2EE13Compliant", "true");
+    defaultProperties.setProperty(
+      OracleConnection.CONNECTION_PROPERTY_IMPLICIT_STATEMENT_CACHE_SIZE, "25");
+    defaultProperties.setProperty(
+      OracleConnection.CONNECTION_PROPERTY_DEFAULT_LOB_PREFETCH_SIZE,
+      "1000000000");
+    defaultProperties.setProperty(
+      OracleConnection.CONNECTION_PROPERTY_THIN_NET_USE_ZERO_COPY_IO,
+      "false");
+
+    return defaultProperties;
+  }
+
+  /**
+   * Returns an Oracle Net Descriptor having the values configured by
+   * {@link DatabaseConfig}
+   * @return An Oracle Net Descriptor for the test database.
+   */
+  private static String createDescriptor() {
+    return format(
+      "(DESCRIPTION=(ADDRESS=(HOST=%s)(PORT=%d)(PROTOCOL=%s))" +
+        "(CONNECT_DATA=(SERVICE_NAME=%s)))",
+      host(), port(),
+      Objects.requireNonNullElse(protocol(), "tcp"),
+      serviceName());
   }
 
   /**

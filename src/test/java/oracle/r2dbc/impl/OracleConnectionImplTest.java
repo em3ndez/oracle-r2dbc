@@ -713,7 +713,7 @@ public class OracleConnectionImplTest {
           .add("SELECT 1 FROM dual")
           .add("SELECT 2 FROM dual")
           .execute())
-          .flatMap(result ->
+          .flatMapSequential(result ->
             result.map((row, metadata) -> row.get(0, Integer.class))));
     }
     finally {
@@ -952,7 +952,7 @@ public class OracleConnectionImplTest {
             "Unexpected value returned by isAutoCommit() before subscribing to"
               + " setAutoCommit(true) publisher");
           awaitMany(
-            List.of(1, 1),
+            List.of(1L, 1L),
             Flux.from(sessionA.createBatch()
               .add("INSERT INTO testSetAutoCommit VALUES ('C')")
               .add("INSERT INTO testSetAutoCommit VALUES ('C')")
@@ -1356,6 +1356,14 @@ public class OracleConnectionImplTest {
    */
   @Test
   public void testSetStatementTimeout() {
+    // Assume that oracle.jdbc.disablePipeline is only set to false when
+    // experimenting with pipelining on Mac OS. In this scenario, statement
+    // cancellation is known to not work.
+    String disabledProperty = System.getProperty("oracle.jdbc.disablePipeline");
+    assumeTrue(
+      disabledProperty == null || disabledProperty.equalsIgnoreCase("true"),
+      "oracle.jdbc.disablePipeline is set, and the value is not \"true\"");
+
     Connection connection =
       Mono.from(sharedConnection()).block(connectTimeout());
     try {

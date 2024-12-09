@@ -22,12 +22,15 @@
 package oracle.r2dbc.impl;
 
 import io.r2dbc.spi.Connection;
+import io.r2dbc.spi.R2dbcException;
 import io.r2dbc.spi.Result;
 import io.r2dbc.spi.Result.Message;
 import io.r2dbc.spi.Result.RowSegment;
 import io.r2dbc.spi.Result.UpdateCount;
 import io.r2dbc.spi.Row;
 import io.r2dbc.spi.RowMetadata;
+import io.r2dbc.spi.Statement;
+import oracle.r2dbc.OracleR2dbcWarning;
 import org.junit.jupiter.api.Test;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
@@ -44,6 +47,7 @@ import java.util.function.Predicate;
 
 import static java.util.Arrays.asList;
 import static oracle.r2dbc.test.DatabaseConfig.connectTimeout;
+import static oracle.r2dbc.test.DatabaseConfig.jdbcVersion;
 import static oracle.r2dbc.test.DatabaseConfig.sharedConnection;
 import static oracle.r2dbc.test.DatabaseConfig.sqlTimeout;
 import static oracle.r2dbc.util.Awaits.awaitError;
@@ -51,10 +55,13 @@ import static oracle.r2dbc.util.Awaits.awaitExecution;
 import static oracle.r2dbc.util.Awaits.awaitMany;
 import static oracle.r2dbc.util.Awaits.awaitNone;
 import static oracle.r2dbc.util.Awaits.awaitOne;
+import static oracle.r2dbc.util.Awaits.awaitUpdate;
 import static oracle.r2dbc.util.Awaits.consumeOne;
 import static oracle.r2dbc.util.Awaits.tryAwaitExecution;
 import static oracle.r2dbc.util.Awaits.tryAwaitNone;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -89,9 +96,9 @@ public class OracleResultImplTest {
           .toIterable()
           .iterator();
       Result insertResult0 = insertResults.next();
-      Publisher<Integer> insertCountPublisher0 =
+      Publisher<Long> insertCountPublisher0 =
         insertResult0.getRowsUpdated();
-      awaitOne(1, insertCountPublisher0);
+      awaitOne(1L, insertCountPublisher0);
 
       // Expect IllegalStateException from multiple Result consumptions.
       assertThrows(IllegalStateException.class,
@@ -100,12 +107,12 @@ public class OracleResultImplTest {
         () -> insertResult0.map((row, metadata) -> "unexpected"));
 
       // Expect update count publisher to support multiple subscribers
-      awaitOne(1, insertCountPublisher0);
+      awaitOne(1L, insertCountPublisher0);
 
       Result insertResult1 = insertResults.next();
-      Publisher<Integer> insertCountPublisher1 =
+      Publisher<Long> insertCountPublisher1 =
         insertResult1.getRowsUpdated();
-      awaitOne(1, insertCountPublisher1);
+      awaitOne(1L, insertCountPublisher1);
 
       // Expect IllegalStateException from multiple Result consumptions.
       assertThrows(IllegalStateException.class,
@@ -114,16 +121,16 @@ public class OracleResultImplTest {
         () -> insertResult1.map((row, metadata) -> "unexpected"));
 
       // Expect update count publisher to support multiple subscribers
-      awaitOne(1, insertCountPublisher1);
+      awaitOne(1L, insertCountPublisher1);
 
       // Expect an update count of zero from UPDATE of zero rows
       consumeOne(connection.createStatement(
         "UPDATE testGetRowsUpdated SET y = 99 WHERE x = 99")
         .execute(),
         noUpdateResult -> {
-          Publisher<Integer> noUpdateCountPublisher =
+          Publisher<Long> noUpdateCountPublisher =
             noUpdateResult.getRowsUpdated();
-          awaitOne(0, noUpdateCountPublisher);
+          awaitOne(0L, noUpdateCountPublisher);
 
           // Expect IllegalStateException from multiple Result consumptions.
           assertThrows(IllegalStateException.class,
@@ -131,7 +138,7 @@ public class OracleResultImplTest {
           assertThrows(IllegalStateException.class, noUpdateResult::getRowsUpdated);
 
           // Expect update count publisher to support multiple subscribers
-          awaitOne(0, noUpdateCountPublisher);
+          awaitOne(0L, noUpdateCountPublisher);
         });
 
       // Expect update count of 2 from UPDATE of 2 rows
@@ -139,8 +146,8 @@ public class OracleResultImplTest {
         "UPDATE testGetRowsUpdated SET y = 2 WHERE x = 0")
         .execute(),
         updateResult -> {
-        Publisher<Integer> updateCountPublisher = updateResult.getRowsUpdated();
-        awaitOne(2, updateCountPublisher);
+        Publisher<Long> updateCountPublisher = updateResult.getRowsUpdated();
+        awaitOne(2L, updateCountPublisher);
 
         // Expect IllegalStateException from multiple Result consumptions.
         assertThrows(IllegalStateException.class,
@@ -148,7 +155,7 @@ public class OracleResultImplTest {
         assertThrows(IllegalStateException.class, updateResult::getRowsUpdated);
 
         // Expect update count publisher to support multiple subscribers
-        awaitOne(2, updateCountPublisher);
+        awaitOne(2L, updateCountPublisher);
       });
 
       // Expect no update count from SELECT
@@ -156,11 +163,11 @@ public class OracleResultImplTest {
         "SELECT x,y FROM testGetRowsUpdated")
         .execute())
         .flatMapMany(selectResult -> {
-          Publisher<Integer> selectCountPublisher =
+          Publisher<Long> selectCountPublisher =
             selectResult.getRowsUpdated();
 
           // Expect update count publisher to support multiple subscribers
-          Publisher<Integer> result = Flux.concat(
+          Publisher<Long> result = Flux.concat(
             Mono.from(selectCountPublisher).cache(),
             Mono.from(selectCountPublisher).cache());
 
@@ -178,8 +185,8 @@ public class OracleResultImplTest {
         .bind("x", 0)
         .execute(),
         deleteResult -> {
-          Publisher<Integer> deleteCountPublisher = deleteResult.getRowsUpdated();
-          awaitOne(2, deleteCountPublisher);
+          Publisher<Long> deleteCountPublisher = deleteResult.getRowsUpdated();
+          awaitOne(2L, deleteCountPublisher);
 
           // Expect IllegalStateException from multiple Result consumptions.
           assertThrows(IllegalStateException.class,
@@ -187,7 +194,7 @@ public class OracleResultImplTest {
           assertThrows(IllegalStateException.class, deleteResult::getRowsUpdated);
 
           // Expect update count publisher to support multiple subscribers
-          awaitOne(2, deleteCountPublisher);
+          awaitOne(2L, deleteCountPublisher);
         });
     }
     finally {
@@ -473,7 +480,7 @@ public class OracleResultImplTest {
       // UpdateCount segment to be published by getRowsUpdated
       AtomicReference<UpdateCount> unfilteredUpdateCount =
         new AtomicReference<>(null);
-      awaitOne(1, Flux.from(connection.createStatement(
+      awaitOne(1L, Flux.from(connection.createStatement(
         "INSERT INTO testFilter VALUES (1)")
         .execute())
         .map(result ->
@@ -529,7 +536,7 @@ public class OracleResultImplTest {
         .execute())
         .block(sqlTimeout());
       Result filteredResult = unfilteredResult.filter(segment -> false);
-      Publisher<Integer> filteredUpdateCounts = filteredResult.getRowsUpdated();
+      Publisher<Long> filteredUpdateCounts = filteredResult.getRowsUpdated();
       assertThrows(
         IllegalStateException.class, unfilteredResult::getRowsUpdated);
       assertThrows(
@@ -545,13 +552,13 @@ public class OracleResultImplTest {
         .block(sqlTimeout());
       Result filteredResult2 = unfilteredResult2.filter(segment ->
         fail("Unexpected invocation"));
-      Publisher<Integer> unfilteredUpdateCounts =
+      Publisher<Long> unfilteredUpdateCounts =
         unfilteredResult2.getRowsUpdated();
       assertThrows(
         IllegalStateException.class, filteredResult2::getRowsUpdated);
       assertThrows(
         IllegalStateException.class, unfilteredResult2::getRowsUpdated);
-      awaitOne(1, unfilteredUpdateCounts);
+      awaitOne(1L, unfilteredUpdateCounts);
 
       // Execute an INSERT that fails, and filter Message type segments.
       // Expect the Result to not emit {@code onError} when consumed.
@@ -620,6 +627,134 @@ public class OracleResultImplTest {
     }
     finally {
       tryAwaitExecution(connection.createStatement("DROP TABLE testFlatMap"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies that a warnings are emitted as
+   * {@link oracle.r2dbc.OracleR2dbcWarning} segments.
+   */
+  @Test
+  public void testOracleR2dbcWarning() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+
+      // Expect a warning for invalid PL/SQL
+      // table
+      String sql = "CREATE OR REPLACE PROCEDURE testOracleR2dbcWarning AS" +
+        " BEGIN this is not valid pl/sql; END;";
+      Statement warningStatement = connection.createStatement(sql);
+
+      // Collect the segments
+      List<Result.Segment> segments =
+        awaitMany(Flux.from(warningStatement.execute())
+          .flatMap(result -> result.flatMap(Mono::just)));
+
+      // Expect the update count segment first. Warnings are always emitted
+      // last.
+      Result.Segment firstSegment = segments.get(0);
+      assertEquals(0,
+        assertInstanceOf(UpdateCount.class, firstSegment).value());
+      assertFalse(firstSegment instanceof OracleR2dbcWarning);
+
+      // Expect the warning segment after the update count. Expect it to have
+      // the fixed message and error number used by Oracle JDBC for all warnings
+      Result.Segment secondSegment = segments.get(1);
+      OracleR2dbcWarning warning =
+        assertInstanceOf(OracleR2dbcWarning.class, secondSegment);
+      String expectedMessage =
+        // Oracle JDBC includes more information in 23.3
+        jdbcVersion() == 21
+          ? "Warning: execution completed with warning"
+          : "Warning: ORA-17110: Execution completed with warning.\n" +
+              "https://docs.oracle.com/error-help/db/ora-17110/";
+      assertEquals(expectedMessage, warning.message());
+      assertEquals(warning.errorCode(), 17110);
+      assertEquals("99999", warning.sqlState()); // Default SQL state
+      R2dbcException exception =
+        assertInstanceOf(R2dbcException.class, warning.exception());
+      assertEquals(warning.message(), exception.getMessage());
+      assertEquals(warning.errorCode(), exception.getErrorCode());
+      assertEquals(warning.sqlState(), exception.getSqlState());
+      assertEquals(sql, exception.getSql());
+
+      // Verify that there are not any more segments
+      assertEquals(2, segments.size());
+    }
+    finally {
+      tryAwaitExecution(
+        connection.createStatement("DROP PROCEDURE testOracleR2dbcWarning"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies that a warnings are not emitted as onError signals
+   */
+  @Test
+  public void testOracleR2dbcWarningIgnored() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+
+      // Expect a warning for invalid PL/SQL
+      String sql =
+        "CREATE OR REPLACE PROCEDURE testOracleR2dbcWarningIgnored AS" +
+          " BEGIN this is not valid pl/sql; END;";
+      Statement warningStatement = connection.createStatement(sql);
+
+      // Verify that an update count of 0 is returned.
+      awaitUpdate(0, warningStatement);
+
+      // Verify that no rows are returned
+      awaitNone(
+        awaitOne(warningStatement.execute())
+          .map(row -> "UNEXPECTED ROW"));
+
+      // Verify that no rows are returned
+      awaitNone(
+        awaitOne(warningStatement.execute())
+          .map((row, metadata) -> "UNEXPECTED ROW WITH METADATA"));
+    }
+    finally {
+      tryAwaitExecution(
+        connection.createStatement(
+          "DROP PROCEDURE testOracleR2dbcWarningIgnored"));
+      tryAwaitNone(connection.close());
+    }
+  }
+
+  /**
+   * Verifies that {@link Result#flatMap(Function)} may be used to convert
+   * warnings into onError signals
+   */
+  @Test
+  public void testOracleR2dbcWarningNotIgnored() {
+    Connection connection = awaitOne(sharedConnection());
+    try {
+      // Expect a warning for invalid PL/SQL
+      String sql =
+        "CREATE OR REPLACE PROCEDURE testOracleR2dbcWarningIgnored AS" +
+          " BEGIN this is not valid pl/sql; END;";
+      Statement warningStatement = connection.createStatement(sql);
+      AtomicInteger segmentIndex = new AtomicInteger(0);
+      awaitError(
+        R2dbcException.class,
+        awaitOne(warningStatement.execute())
+          .flatMap(segment ->
+            // Expect the update count first, followed by the warning
+            segmentIndex.getAndIncrement() == 0
+              ? Mono.just(assertInstanceOf(UpdateCount.class, segment)
+                  .value())
+              : Mono.error(assertInstanceOf(OracleR2dbcWarning.class, segment)
+                  .exception())));
+      // Expect only two segments
+      assertEquals(2, segmentIndex.get());
+    }
+    finally {
+      tryAwaitExecution(
+        connection.createStatement(
+          "DROP PROCEDURE testOracleR2dbcWarningIgnored"));
       tryAwaitNone(connection.close());
     }
   }
